@@ -35,6 +35,21 @@ const featureByName = {}; DATA.features.forEach(f=>featureByName[f.name]=f);
 const pageByName = {}; DATA.pages.forEach(p=>pageByName[p.name]=p);
 const areaByName = {}; DATA.productAreas.forEach(a=>areaByName[a.name]=a);
 const pdTaskByName = {}; DATA.pdTasks.forEach(t=>pdTaskByName[t.name]=t);
+const appById = {};
+const featureById = {};
+const pageById = {};
+const areaById = {};
+const pdTaskById = {};
+
+function rebuildLookups(){
+  [appByName, featureByName, pageByName, areaByName, pdTaskByName, appById, featureById, pageById, areaById, pdTaskById]
+    .forEach(map=>Object.keys(map).forEach(k=>delete map[k]));
+  DATA.apps.forEach(a=>{ appByName[a.name]=a; if(a.id) appById[a.id]=a; });
+  DATA.features.forEach(f=>{ featureByName[f.name]=f; if(f.id) featureById[f.id]=f; });
+  DATA.pages.forEach(p=>{ pageByName[p.name]=p; if(p.id) pageById[p.id]=p; });
+  DATA.productAreas.forEach(a=>{ areaByName[a.name]=a; if(a.id) areaById[a.id]=a; });
+  DATA.pdTasks.forEach(t=>{ pdTaskByName[t.name]=t; if(t.id) pdTaskById[t.id]=t; });
+}
 
 function initials(str){
   if(!str) return '?';
@@ -134,6 +149,66 @@ async function personalDelete(key){
   await rawDelete(key, false);
 }
 
+const PORTAL_DATA_KEY = 'portal-data-v2';
+
+function makeStableId(prefix){
+  return prefix+'-'+Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+}
+function ensureListIds(list, prefix){
+  let changed = false;
+  (list||[]).forEach(item=>{
+    if(!item.id){ item.id = makeStableId(prefix); changed = true; }
+  });
+  return changed;
+}
+function ensurePortalDataIds(){
+  let changed = false;
+  changed = ensureListIds(DATA.apps, 'app') || changed;
+  changed = ensureListIds(DATA.features, 'feat') || changed;
+  changed = ensureListIds(DATA.pages, 'page') || changed;
+  changed = ensureListIds(DATA.productAreas, 'area') || changed;
+  changed = ensureListIds(DATA.pdTasks, 'pdt') || changed;
+  if(!Array.isArray(DATA.uxrSeedTasks)){
+    DATA.uxrSeedTasks = [];
+    DATA.pdTasks.forEach(t=>{
+      (t.uxrTasks||[]).forEach(uxrName=>{
+        DATA.uxrSeedTasks.push({
+          id: makeStableId('uxr'),
+          name: uxrName,
+          parentPdTaskId: t.id,
+          assignee: 'Unassigned',
+          estDate: t.estDate || ''
+        });
+      });
+    });
+    changed = true;
+  } else {
+    DATA.uxrSeedTasks.forEach(t=>{
+      if(!t.id){ t.id = makeStableId('uxr'); changed = true; }
+    });
+  }
+  return changed;
+}
+function applyPersistedData(persisted){
+  const next = persisted && typeof persisted === 'object' ? persisted : null;
+  if(!next) return false;
+  ['apps','features','pages','pdTasks','productAreas','uxrSeedTasks'].forEach(k=>{
+    if(Array.isArray(next[k])) DATA[k] = next[k];
+  });
+  return true;
+}
+async function savePortalData(){
+  rebuildLookups();
+  await storageSet(PORTAL_DATA_KEY, DATA);
+}
+async function loadPortalData(){
+  const persisted = await storageGet(PORTAL_DATA_KEY);
+  applyPersistedData(persisted);
+  const changed = ensurePortalDataIds();
+  rebuildLookups();
+  if(!persisted || changed) await savePortalData();
+}
+
 function seedHistory(status, atISO){
   return [{status, enteredAt: atISO, exitedAt:null, isSeed:true}];
 }
@@ -148,18 +223,28 @@ async function loadBoards(){
   const nowISO = new Date().toISOString();
 
   DATA.pdTasks.forEach(t=>{
-    if(!pdBoardState.states[t.name]){
-      pdBoardState.states[t.name] = {status: t.status || 'Not Started', history: seedHistory(t.status || 'Not Started', nowISO)};
+    const tid = t.id || t.name;
+    if(!pdBoardState.states[tid] && pdBoardState.states[t.name]){
+      pdBoardState.states[tid] = pdBoardState.states[t.name];
+      delete pdBoardState.states[t.name];
+      pdChanged = true;
+    }
+    if(!pdBoardState.states[tid]){
+      pdBoardState.states[tid] = {status: t.status || 'Not Started', history: seedHistory(t.status || 'Not Started', nowISO)};
       pdChanged = true;
     }
   });
-  DATA.pdTasks.forEach(t=>{
-    (t.uxrTasks||[]).forEach(uxrName=>{
-      if(!uxrBoardState.states[uxrName]){
-        uxrBoardState.states[uxrName] = {status:'Not Started', history: seedHistory('Not Started', nowISO)};
+  (DATA.uxrSeedTasks||[]).forEach(t=>{
+    const tid = t.id || t.name;
+    if(!uxrBoardState.states[tid] && uxrBoardState.states[t.name]){
+      uxrBoardState.states[tid] = uxrBoardState.states[t.name];
+      delete uxrBoardState.states[t.name];
+      uxrChanged = true;
+    }
+    if(!uxrBoardState.states[tid]){
+      uxrBoardState.states[tid] = {status:'Not Started', history: seedHistory('Not Started', nowISO)};
         uxrChanged = true;
-      }
-    });
+    }
   });
   if(pdChanged) await storageSet('pd-board-state', pdBoardState);
   if(uxrChanged) await storageSet('uxr-board-state', uxrBoardState);
@@ -170,7 +255,7 @@ async function loadBoards(){
    ============================================================ */
 function getAllPdTasks(){
   const base = DATA.pdTasks.map(t=>({
-    id: t.name, title: t.name, appName: (t.apps&&t.apps[0])||'', featureName: t.feature||'',
+    id: t.id || t.name, title: t.name, appName: (t.apps&&t.apps[0])||'', featureName: t.feature||'',
     pages: t.pages||[], assignee: (t.pd&&t.pd.join(', '))||'Unassigned', estDate: t.estDate||'',
     files: t.files||[], productArea: t.productArea||'', custom:false
   }));
@@ -182,12 +267,14 @@ function getAllPdTasks(){
   });
 }
 function getAllUxrTasks(){
-  const base = [];
-  DATA.pdTasks.forEach(t=>{
-    (t.uxrTasks||[]).forEach(uxrName=>{
-      base.push({id:uxrName, title:uxrName, parentPdTask:t.name, assignee:'Unassigned', estDate:t.estDate||'', custom:false});
-    });
-  });
+  const base = (DATA.uxrSeedTasks||[]).map(t=>({
+    id: t.id || t.name,
+    title: t.name,
+    parentPdTask: t.parentPdTaskId || t.parentPdTask || '',
+    assignee: t.assignee || 'Unassigned',
+    estDate: t.estDate || '',
+    custom:false
+  }));
   const customs = uxrBoardState.tasksCustom || [];
   const all = base.concat(customs);
   return all.map(t=>{
@@ -833,9 +920,115 @@ document.getElementById('dbSubtabs').addEventListener('click', e=>{
 document.getElementById('dbSearch').addEventListener('input', e=>{ dbQuery = e.target.value.toLowerCase(); renderDatabase(); });
 
 function pdTaskStatusFor(name){
-  const st = pdBoardState.states[name];
+  const task = pdTaskByName[name] || pdTaskById[name];
+  const st = pdBoardState.states[task ? (task.id || task.name) : name];
   return st ? st.status : null;
 }
+
+function replaceInArray(arr, oldVal, newVal){
+  if(!Array.isArray(arr)) return;
+  for(let i=0;i<arr.length;i++) if(arr[i]===oldVal) arr[i]=newVal;
+}
+function cascadeRename(type, oldName, newName){
+  if(!oldName || oldName===newName) return;
+  if(type==='apps'){
+    DATA.features.forEach(f=>replaceInArray(f.apps, oldName, newName));
+    DATA.pages.forEach(p=>replaceInArray(p.apps, oldName, newName));
+    DATA.productAreas.forEach(a=>replaceInArray(a.apps, oldName, newName));
+    DATA.pdTasks.forEach(t=>replaceInArray(t.apps, oldName, newName));
+  } else if(type==='features'){
+    DATA.apps.forEach(a=>replaceInArray(a.features, oldName, newName));
+    DATA.pages.forEach(p=>replaceInArray(p.features, oldName, newName));
+    DATA.pdTasks.forEach(t=>{ if(t.feature===oldName) t.feature=newName; });
+  } else if(type==='pages'){
+    DATA.apps.forEach(a=>replaceInArray(a.surfaces, oldName, newName));
+    DATA.features.forEach(f=>replaceInArray(f.surfaces, oldName, newName));
+    DATA.productAreas.forEach(a=>replaceInArray(a.pages, oldName, newName));
+    DATA.pdTasks.forEach(t=>replaceInArray(t.pages, oldName, newName));
+    DATA.pages.forEach(p=>{
+      if(p.parent===oldName) p.parent = newName;
+      else if((p.parent||'').includes('\n')) p.parent = p.parent.split('\n').map(x=>x===oldName?newName:x).join('\n');
+    });
+  } else if(type==='areas'){
+    DATA.apps.forEach(a=>replaceInArray(a.productAreas, oldName, newName));
+    DATA.pages.forEach(p=>replaceInArray(p.productAreas, oldName, newName));
+    DATA.pdTasks.forEach(t=>{ if(t.productArea===oldName) t.productArea=newName; });
+  }
+}
+function getDbList(type){
+  if(type==='areas') return DATA.productAreas;
+  return DATA[type];
+}
+function openDbEntityModal(type, id){
+  const list = getDbList(type);
+  const item = id ? list.find(x=>x.id===id) : null;
+  const title = item ? `Edit ${type.slice(0,-1)}` : `Add ${type.slice(0,-1)}`;
+  const desc = item && item.description ? item.description : '';
+  const typ = item && item.type ? item.type : 'Page';
+  const parent = item && item.parent ? item.parent : '';
+  openModal(`
+    <h3>${escapeHtml(title)}</h3>
+    <div class="field"><label>Name</label><input id="db_name" value="${escAttr(item?item.name:'')}"></div>
+    <div class="field"><label>Description</label><textarea id="db_desc">${escapeHtml(desc)}</textarea></div>
+    ${type==='pages' ? `<div class="field"><label>Type</label><input id="db_type" value="${escAttr(typ)}"></div><div class="field"><label>Parent</label><input id="db_parent" value="${escAttr(parent)}"></div>` : ''}
+    <div class="modal-actions">
+      ${item?'<button class="btn ghost" id="db_delete">Delete</button>':''}
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" id="db_save">Save</button>
+    </div>
+  `);
+  document.getElementById('db_save').addEventListener('click', async ()=>{
+    const name = document.getElementById('db_name').value.trim();
+    if(!name){ showToast('Name is required'); return; }
+    const oldName = item ? item.name : '';
+    if(item){
+      item.name = name;
+      if('description' in item) item.description = document.getElementById('db_desc').value.trim();
+      if(type==='pages'){
+        item.type = document.getElementById('db_type').value.trim() || 'Page';
+        item.parent = document.getElementById('db_parent').value.trim();
+      }
+      cascadeRename(type, oldName, name);
+    } else {
+      const created = {id:makeStableId(type.slice(0,-1)), name};
+      if(type==='apps') Object.assign(created, {description:document.getElementById('db_desc').value.trim(), designLink:'', dsLink:'', platform:[], surfaces:[], productAreas:[], features:[], tasks:[]});
+      else if(type==='features') Object.assign(created, {description:document.getElementById('db_desc').value.trim(), pm:'', team:'', apps:[], surfaces:[], tasks:[], taskStatus:[], files:[], pd:[], prd:''});
+      else if(type==='pages') Object.assign(created, {description:document.getElementById('db_desc').value.trim(), designLink:'', productAreas:[], parent:document.getElementById('db_parent').value.trim(), apps:[], features:[], type:document.getElementById('db_type').value.trim()||'Page', tasks:[]});
+      else if(type==='areas') Object.assign(created, {apps:[], pages:[], tasks:[]});
+      list.push(created);
+    }
+    closeModal();
+    await savePortalData();
+    renderAll();
+    showToast('Saved');
+  });
+  if(item){
+    document.getElementById('db_delete').addEventListener('click', async ()=>{
+      const idx = list.findIndex(x=>x.id===item.id);
+      if(idx>=0) list.splice(idx,1);
+      const oldName = item.name;
+      if(type==='apps'){
+        DATA.features.forEach(f=>f.apps=(f.apps||[]).filter(n=>n!==oldName));
+        DATA.pages.forEach(p=>p.apps=(p.apps||[]).filter(n=>n!==oldName));
+      } else if(type==='features'){
+        DATA.apps.forEach(a=>a.features=(a.features||[]).filter(n=>n!==oldName));
+        DATA.pages.forEach(p=>p.features=(p.features||[]).filter(n=>n!==oldName));
+      } else if(type==='pages'){
+        DATA.apps.forEach(a=>a.surfaces=(a.surfaces||[]).filter(n=>n!==oldName));
+        DATA.features.forEach(f=>f.surfaces=(f.surfaces||[]).filter(n=>n!==oldName));
+      } else if(type==='areas'){
+        DATA.apps.forEach(a=>a.productAreas=(a.productAreas||[]).filter(n=>n!==oldName));
+        DATA.pages.forEach(p=>p.productAreas=(p.productAreas||[]).filter(n=>n!==oldName));
+      }
+      closeModal();
+      closeDrawer();
+      await savePortalData();
+      renderAll();
+      showToast('Deleted');
+    });
+  }
+}
+window.openDbEntityModal = openDbEntityModal;
 
 function renderDatabase(){
   const grid = document.getElementById('dbGrid');
@@ -851,6 +1044,14 @@ function renderDatabase(){
     return hay.includes(dbQuery);
   });
   document.getElementById('dbCount').textContent = filtered.length + ' of ' + items.length;
+  if(!document.getElementById('dbAddBtn')){
+    const btn = document.createElement('button');
+    btn.id = 'dbAddBtn';
+    btn.className = 'btn small';
+    btn.textContent = 'Add';
+    btn.addEventListener('click', ()=>openDbEntityModal(dbTab));
+    document.querySelector('.db-toolbar').appendChild(btn);
+  }
 
   if(filtered.length===0){
     grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><p>Nothing matches "${escapeHtml(dbQuery)}".</p></div>`;
@@ -859,7 +1060,7 @@ function renderDatabase(){
 
   if(dbTab==='apps'){
     grid.innerHTML = filtered.map(a=>`
-      <div class="db-tile" onclick="openDetail('app','${escAttr(a.name)}')">
+      <div class="db-tile" onclick="openDetail('app','${escAttr(a.id || a.name)}')">
         <div class="t-top"><h4>${escapeHtml(a.name)}</h4></div>
         <div class="t-desc">${escapeHtml(a.description||'No description yet.')}</div>
         <div class="t-meta">
@@ -870,7 +1071,7 @@ function renderDatabase(){
       </div>`).join('');
   } else if(dbTab==='features'){
     grid.innerHTML = filtered.map(f=>`
-      <div class="db-tile" onclick="openDetail('feature','${escAttr(f.name)}')">
+      <div class="db-tile" onclick="openDetail('feature','${escAttr(f.id || f.name)}')">
         <div class="t-top"><h4>${escapeHtml(f.name)}</h4></div>
         <div class="t-desc">${escapeHtml(f.description||'No description yet.')}</div>
         <div class="t-meta">
@@ -881,7 +1082,7 @@ function renderDatabase(){
       </div>`).join('');
   } else if(dbTab==='pages'){
     grid.innerHTML = filtered.map(p=>`
-      <div class="db-tile" onclick="openDetail('page','${escAttr(p.name)}')">
+      <div class="db-tile" onclick="openDetail('page','${escAttr(p.id || p.name)}')">
         <div class="t-top"><h4>${escapeHtml(p.name)}</h4></div>
         <div class="t-desc">${escapeHtml((p.apps||[]).join(', ')||'—')}${p.parent?' · sub-page of '+escapeHtml(p.parent):''}</div>
         <div class="t-meta">
@@ -892,7 +1093,7 @@ function renderDatabase(){
       </div>`).join('');
   } else {
     grid.innerHTML = filtered.map(ar=>`
-      <div class="db-tile" onclick="openDetail('area','${escAttr(ar.name)}')">
+      <div class="db-tile" onclick="openDetail('area','${escAttr(ar.id || ar.name)}')">
         <div class="t-top"><h4>${escapeHtml(ar.name)}</h4></div>
         <div class="t-desc">${ar.apps.length} app${ar.apps.length===1?'':'s'} · ${ar.pages.length} page${ar.pages.length===1?'':'s'} · ${ar.tasks.length} task${ar.tasks.length===1?'':'s'}</div>
         <div class="t-meta">${ar.apps.slice(0,4).map(a=>`<span class="tag">${escapeHtml(a)}</span>`).join('')}</div>
@@ -912,10 +1113,10 @@ window.closeDrawer = function(){ document.getElementById('drawerBackdrop').class
 document.getElementById('drawerBackdrop').addEventListener('click', e=>{ if(e.target.id==='drawerBackdrop') closeDrawer(); });
 
 window.openDetail = function(type, name){
-  if(type==='app') return openAppDetail(appByName[name]);
-  if(type==='feature') return openFeatureDetail(featureByName[name]);
-  if(type==='page') return openPageDetail(pageByName[name]);
-  if(type==='area') return openAreaDetail(areaByName[name]);
+  if(type==='app') return openAppDetail(appById[name] || appByName[name]);
+  if(type==='feature') return openFeatureDetail(featureById[name] || featureByName[name]);
+  if(type==='page') return openPageDetail(pageById[name] || pageByName[name]);
+  if(type==='area') return openAreaDetail(areaById[name] || areaByName[name]);
 };
 
 function linkItem(type, name, sub){
@@ -932,6 +1133,7 @@ function openAppDetail(a){
   if(!a) return;
   openDrawer(`
     <div class="d-type">App</div>
+    <div class="head-actions" style="margin-top:8px"><button class="btn small" onclick="openDbEntityModal('apps','${escAttr(a.id||'')}')">Edit / Delete</button></div>
     <h2>${escapeHtml(a.name)}</h2>
     <div class="d-desc">${escapeHtml(a.description||'No description yet.')}</div>
     <div class="t-meta">${a.platform.map(p=>`<span class="tag">${escapeHtml(p)}</span>`).join('')}</div>
@@ -958,6 +1160,7 @@ function openFeatureDetail(f){
   if(!f) return;
   openDrawer(`
     <div class="d-type">Feature</div>
+    <div class="head-actions" style="margin-top:8px"><button class="btn small" onclick="openDbEntityModal('features','${escAttr(f.id||'')}')">Edit / Delete</button></div>
     <h2>${escapeHtml(f.name)}</h2>
     <div class="d-desc">${escapeHtml(f.description||'No description yet.')}</div>
     <div class="t-meta">${f.team?`<span class="tag">${escapeHtml(f.team)}</span>`:''}${f.pm?`<span class="tag">PM: ${escapeHtml(f.pm)}</span>`:''}${f.pd.map(p=>`<span class="tag acc">PD: ${escapeHtml(p)}</span>`).join('')}</div>
@@ -981,6 +1184,7 @@ function openPageDetail(p){
   const children = DATA.pages.filter(x=>x.parent===p.name);
   openDrawer(`
     <div class="d-type">${escapeHtml(p.type||'Page')}</div>
+    <div class="head-actions" style="margin-top:8px"><button class="btn small" onclick="openDbEntityModal('pages','${escAttr(p.id||'')}')">Edit / Delete</button></div>
     <h2>${escapeHtml(p.name)}</h2>
     ${p.designLink?`<div class="d-desc"><a class="ext-link" href="${p.designLink}" target="_blank">Open in Figma →</a></div>`:''}
     <div class="t-meta">${(p.productAreas||[]).map(n=>`<span class="tag acc">${escapeHtml(n)}</span>`).join('')}</div>
@@ -1001,6 +1205,7 @@ function openAreaDetail(ar){
   if(!ar) return;
   openDrawer(`
     <div class="d-type">Product area</div>
+    <div class="head-actions" style="margin-top:8px"><button class="btn small" onclick="openDbEntityModal('areas','${escAttr(ar.id||'')}')">Edit / Delete</button></div>
     <h2>${escapeHtml(ar.name)}</h2>
     <div class="d-section"><h5>Apps (${ar.apps.length})</h5><div class="d-list">
       ${ar.apps.length?ar.apps.map(n=>appByName[n]?linkItem('app',n):'').join(''):'<span class="d-empty">None</span>'}
@@ -1026,12 +1231,12 @@ let mapLayout = null;
 let mapHighlightKey = null;
 
 function getTaskUxrAssignees(taskName){
-  const pdTask = pdTaskByName[taskName];
-  if(!pdTask || !pdTask.uxrTasks || !pdTask.uxrTasks.length) return [];
+  const pdTask = pdTaskByName[taskName] || pdTaskById[taskName];
+  if(!pdTask) return [];
   const allUxr = getAllUxrTasks();
   const names = new Set();
-  pdTask.uxrTasks.forEach(uxrName=>{
-    const t = allUxr.find(x=>x.id===uxrName);
+  const related = allUxr.filter(x=>x.parentPdTask===pdTask.id || x.parentPdTask===pdTask.name || (pdTask.uxrTasks||[]).includes(x.title));
+  related.forEach(t=>{
     if(t && t.assignee){
       t.assignee.split(',').map(s=>s.trim()).filter(Boolean).forEach(n=>names.add(n));
     }
@@ -1410,7 +1615,7 @@ document.getElementById('viewLogBtn').addEventListener('click', ()=>{
 });
 
 function uxrTaskAppName(t){
-  const parent = getAllPdTasks().find(x=>x.id===t.parentPdTask);
+  const parent = getAllPdTasks().find(x=>x.id===t.parentPdTask || x.title===t.parentPdTask);
   return parent ? parent.appName : '';
 }
 
@@ -1558,10 +1763,16 @@ function openPdCardDetail(id){
     ${t.pages && t.pages.length?`<div class="d-section"><h5>Pages</h5><div class="d-list">${t.pages.map(p=>pageByName[p]?linkItemAndClose('page',p):`<span class="d-empty">${escapeHtml(p)}</span>`).join('')}</div></div>`:''}
     ${t.files && t.files.length?`<div class="d-section"><h5>Design &amp; research files</h5><div class="d-list">${t.files.map(u=>`<a class="ext-link" href="${u}" target="_blank">${escapeHtml(u)}</a>`).join('<br>')}</div></div>`:''}
     <div class="d-section"><h5>Status history &amp; time tracking</h5>${historyHtml(t.history)}</div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="editTask('pd','${escAttr(t.id)}')">Edit task</button>
+      <button class="btn ghost" onclick="deleteTask('pd','${escAttr(t.id)}')">Delete task</button>
+    </div>
   `);
 }
 function openUxrCardDetail(id){
   const t = getAllUxrTasks().find(x=>x.id===id); if(!t) return;
+  const parent = getAllPdTasks().find(x=>x.id===t.parentPdTask || x.title===t.parentPdTask);
+  const parentLabel = parent ? parent.title : t.parentPdTask;
   openDrawer(`
     <div class="d-type">UXR Task${t.custom?' · custom':''}</div>
     <h2>${escapeHtml(t.title)}</h2>
@@ -1579,14 +1790,119 @@ function openUxrCardDetail(id){
       </div>
       ${t.applicableStatuses?`<div class="d-empty" style="margin-top:6px">This task only uses: ${t.applicableStatuses.map(escapeHtml).join(', ')}</div>`:''}
     </div>
-    ${t.parentPdTask?`<div class="d-section"><h5>Requested by PD task</h5><div class="d-list"><div class="d-link-item" style="cursor:default"><span>${escapeHtml(t.parentPdTask)}</span>${taskStatusChip(t.parentPdTask)}</div></div></div>`:''}
+    ${t.parentPdTask?`<div class="d-section"><h5>Requested by PD task</h5><div class="d-list"><div class="d-link-item" style="cursor:default"><span>${escapeHtml(parentLabel)}</span>${taskStatusChip(parent ? parent.id : t.parentPdTask)}</div></div></div>`:''}
     <div class="d-section"><h5>Status history &amp; time tracking</h5>${historyHtml(t.history)}</div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="editTask('uxr','${escAttr(t.id)}')">Edit task</button>
+      <button class="btn ghost" onclick="deleteTask('uxr','${escAttr(t.id)}')">Delete task</button>
+    </div>
   `);
 }
 function linkItemAndClose(type,name){
   return `<div class="d-link-item" onclick="closeDrawer();setTimeout(()=>openDetail('${type}','${escAttr(name)}'),160)"><span>${escapeHtml(name)}</span></div>`;
 }
+async function deleteTask(board, id){
+  if(board==='pd'){
+    const task = getAllPdTasks().find(x=>x.id===id);
+    pdBoardState.tasksCustom = (pdBoardState.tasksCustom||[]).filter(t=>t.id!==id);
+    const baseIdx = DATA.pdTasks.findIndex(t=>(t.id||t.name)===id);
+    if(baseIdx>=0){
+      const base = DATA.pdTasks[baseIdx];
+      DATA.pdTasks.splice(baseIdx,1);
+      DATA.apps.forEach(a=>a.tasks=(a.tasks||[]).filter(n=>n!==base.name));
+      DATA.features.forEach(f=>f.tasks=(f.tasks||[]).filter(n=>n!==base.name));
+      DATA.pages.forEach(p=>p.tasks=(p.tasks||[]).filter(n=>n!==base.name));
+      DATA.productAreas.forEach(a=>a.tasks=(a.tasks||[]).filter(n=>n!==base.name));
+      const removedIds = (DATA.uxrSeedTasks||[]).filter(u=>u.parentPdTaskId===id).map(u=>u.id);
+      DATA.uxrSeedTasks = (DATA.uxrSeedTasks||[]).filter(u=>u.parentPdTaskId!==id);
+      removedIds.forEach(uid=>delete uxrBoardState.states[uid]);
+    }
+    delete pdBoardState.states[id];
+    await storageSet('pd-board-state', pdBoardState);
+  } else {
+    uxrBoardState.tasksCustom = (uxrBoardState.tasksCustom||[]).filter(t=>t.id!==id);
+    DATA.uxrSeedTasks = (DATA.uxrSeedTasks||[]).filter(t=>(t.id||t.name)!==id);
+    delete uxrBoardState.states[id];
+    await storageSet('uxr-board-state', uxrBoardState);
+  }
+  await savePortalData();
+  closeDrawer();
+  renderAll();
+  showToast('Task deleted');
+}
+function editTask(board, id){
+  const task = board==='pd' ? getAllPdTasks().find(x=>x.id===id) : getAllUxrTasks().find(x=>x.id===id);
+  if(!task) return;
+  const apps = DATA.apps.map(a=>`<option value="${escAttr(a.name)}" ${task.appName===a.name?'selected':''}>${escapeHtml(a.name)}</option>`).join('');
+  const feats = DATA.features.map(f=>`<option value="${escAttr(f.name)}" ${task.featureName===f.name?'selected':''}>${escapeHtml(f.name)}</option>`).join('');
+  const pdOpts = getAllPdTasks().map(t=>`<option value="${escAttr(t.id)}" ${(task.parentPdTask===t.id || task.parentPdTask===t.title)?'selected':''}>${escapeHtml(t.title)}</option>`).join('');
+  openModal(`
+    <h3>Edit ${board.toUpperCase()} task</h3>
+    <div class="field"><label>Task name</label><input id="et_title" value="${escAttr(task.title)}"></div>
+    ${board==='pd'
+      ? `<div class="field"><label>App</label><select id="et_app"><option value="">—</option>${apps}</select></div><div class="field"><label>Feature</label><select id="et_feature"><option value="">—</option>${feats}</select></div>`
+      : `<div class="field"><label>Linked PD task</label><select id="et_parent"><option value="">—</option>${pdOpts}</select></div>`
+    }
+    <div class="field"><label>Assignee</label><input id="et_assignee" value="${escAttr(task.assignee||'')}"></div>
+    <div class="field"><label>Estimated date</label><input id="et_date" type="date" value="${escAttr(task.estDate||'')}"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn primary" id="et_save">Save</button>
+    </div>
+  `);
+  document.getElementById('et_save').addEventListener('click', async ()=>{
+    const title = document.getElementById('et_title').value.trim();
+    if(!title){ showToast('Task name is required'); return; }
+    if(board==='pd'){
+      const base = DATA.pdTasks.find(t=>(t.id||t.name)===id);
+      const custom = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
+      if(base){
+        const oldName = base.name;
+        base.name = title;
+        base.apps = document.getElementById('et_app').value ? [document.getElementById('et_app').value] : [];
+        base.feature = document.getElementById('et_feature').value;
+        base.pd = document.getElementById('et_assignee').value.trim() ? [document.getElementById('et_assignee').value.trim()] : [];
+        base.estDate = document.getElementById('et_date').value;
+        DATA.apps.forEach(a=>replaceInArray(a.tasks, oldName, base.name));
+        DATA.features.forEach(f=>replaceInArray(f.tasks, oldName, base.name));
+        DATA.pages.forEach(p=>replaceInArray(p.tasks, oldName, base.name));
+        DATA.productAreas.forEach(a=>replaceInArray(a.tasks, oldName, base.name));
+      }
+      if(custom){
+        custom.title = title;
+        custom.appName = document.getElementById('et_app').value;
+        custom.featureName = document.getElementById('et_feature').value;
+        custom.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
+        custom.estDate = document.getElementById('et_date').value;
+      }
+      await storageSet('pd-board-state', pdBoardState);
+    } else {
+      const base = (DATA.uxrSeedTasks||[]).find(t=>(t.id||t.name)===id);
+      const custom = (uxrBoardState.tasksCustom||[]).find(t=>t.id===id);
+      if(base){
+        base.name = title;
+        base.parentPdTaskId = document.getElementById('et_parent').value;
+        base.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
+        base.estDate = document.getElementById('et_date').value;
+      }
+      if(custom){
+        custom.title = title;
+        custom.parentPdTask = document.getElementById('et_parent').value;
+        custom.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
+        custom.estDate = document.getElementById('et_date').value;
+      }
+      await storageSet('uxr-board-state', uxrBoardState);
+    }
+    await savePortalData();
+    closeModal();
+    closeDrawer();
+    renderAll();
+    showToast('Task updated');
+  });
+}
 window.moveTask = moveTask;
+window.editTask = editTask;
+window.deleteTask = deleteTask;
 
 /* ============================================================
    ADD TASK MODALS
@@ -2121,6 +2437,7 @@ function showSignin(){
 async function bootApp(user){
   applySignedInUser(user);
   showApp();
+  await loadPortalData();
   await loadBoards();
   renderAll();
   await loadChatData();
@@ -2179,6 +2496,7 @@ document.getElementById('adminOverrideBtn').addEventListener('click', async ()=>
 });
 
 (async function init(){
+  await loadPortalData();
   // give the deferred Google script a moment to load before checking it
   window.addEventListener('load', ()=> setTimeout(initGoogleSignIn, 300));
   setTimeout(initGoogleSignIn, 1200); // fallback in case 'load' already fired
