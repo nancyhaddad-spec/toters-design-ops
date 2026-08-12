@@ -9,12 +9,14 @@ const PD_STATUSES = [
   {id:'Not Started', color:'grey-1'},
   {id:'Research', color:'blue'},
   {id:'Design', color:'orange'},
+  {id:'Testing', color:'cyan'},
   {id:'Design System Review', color:'cyan'},
   {id:'Ready for Dev', color:'grey-2'},
   {id:'In Dev', color:'grey-3'},
   {id:'UI Audit', color:'purple'},
   {id:'Done', color:'green'},
 ];
+const PD_CREATION_STATUSES = ['Research', 'Design', 'Testing'];
 const UXR_STATUSES = [
   {id:'Not Started', color:'grey-1'},
   {id:'Defining/Scoping/Planning', color:'blue'},
@@ -263,7 +265,12 @@ function getAllPdTasks(){
   const all = base.concat(customs);
   return all.map(t=>{
     const st = pdBoardState.states[t.id] || {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString())};
-    return Object.assign({}, t, {status: st.status, history: st.history, applicableStatuses: st.applicableStatuses || null});
+    return Object.assign({}, t, {
+      status: st.status,
+      history: st.history,
+      applicableStatuses: st.applicableStatuses || null,
+      allowedStatuses: normalizeAllowedStatuses('pd', st.applicableStatuses || null)
+    });
   });
 }
 function getAllUxrTasks(){
@@ -279,8 +286,39 @@ function getAllUxrTasks(){
   const all = base.concat(customs);
   return all.map(t=>{
     const st = uxrBoardState.states[t.id] || {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString())};
-    return Object.assign({}, t, {status: st.status, history: st.history, applicableStatuses: st.applicableStatuses || null});
+    return Object.assign({}, t, {
+      status: st.status,
+      history: st.history,
+      applicableStatuses: st.applicableStatuses || null,
+      allowedStatuses: normalizeAllowedStatuses('uxr', st.applicableStatuses || null)
+    });
   });
+}
+
+function normalizeAllowedStatuses(board, applicableStatuses){
+  const full = (board==='pd' ? PD_STATUSES : UXR_STATUSES).map(s=>s.id);
+  if(!Array.isArray(applicableStatuses) || applicableStatuses.length===0) return full;
+  if(board!=='pd') return applicableStatuses;
+  // Legacy support: older entries stored a full explicit set.
+  const optionalSet = new Set(PD_CREATION_STATUSES);
+  const hasNonOptional = applicableStatuses.some(s=>!optionalSet.has(s));
+  if(hasNonOptional) return applicableStatuses;
+  // Current PD behavior: non-optional statuses always apply; optional ones are toggled.
+  const enabledOptional = new Set(applicableStatuses);
+  return full.filter(st=>!optionalSet.has(st) || enabledOptional.has(st));
+}
+function getEnabledPdOptionalStatuses(task){
+  const allowed = task.allowedStatuses || normalizeAllowedStatuses('pd', task.applicableStatuses || null);
+  return PD_CREATION_STATUSES.filter(s=>allowed.includes(s));
+}
+function syncTaskStatus(store, id, nextStatus){
+  const state = store.states[id];
+  if(!state || state.status===nextStatus) return;
+  const nowISO = new Date().toISOString();
+  const last = state.history[state.history.length-1];
+  if(last) last.exitedAt = nowISO;
+  state.history.push({status:nextStatus, enteredAt:nowISO, exitedAt:null, isSeed:false});
+  state.status = nextStatus;
 }
 
 async function moveTask(board, id, newStatus){
@@ -288,15 +326,12 @@ async function moveTask(board, id, newStatus){
   const key = board==='pd' ? 'pd-board-state' : 'uxr-board-state';
   const st = store.states[id];
   if(!st || st.status===newStatus) return;
-  if(st.applicableStatuses && !st.applicableStatuses.includes(newStatus)){
+  const allowed = normalizeAllowedStatuses(board, st.applicableStatuses || null);
+  if(!allowed.includes(newStatus)){
     showToast('This task doesn\u2019t use the "'+newStatus+'" status');
     return;
   }
-  const nowISO = new Date().toISOString();
-  const last = st.history[st.history.length-1];
-  if(last) last.exitedAt = nowISO;
-  st.history.push({status:newStatus, enteredAt:nowISO, exitedAt:null, isSeed:false});
-  st.status = newStatus;
+  syncTaskStatus(store, id, newStatus);
   await storageSet(key, store);
   renderAll();
   showToast('Moved to "'+newStatus+'"');
@@ -1229,6 +1264,93 @@ let mapZoom = 1;
 let mapGraph = null;
 let mapLayout = null;
 let mapHighlightKey = null;
+let mapOpenApps = new Set();
+let mapOpenPages = new Set();
+let mapOpenFeatures = new Set();
+
+function taskAppNames(taskName){
+  const base = DATA.pdTasks.find(t=>t.name===taskName || t.id===taskName);
+  if(base && Array.isArray(base.apps) && base.apps.length) return base.apps;
+  const custom = (pdBoardState.tasksCustom||[]).find(t=>t.title===taskName || t.id===taskName);
+  if(custom && custom.appName) return [custom.appName];
+  return [];
+}
+function pagesForApp(appName){
+  return DATA.pages.filter(p=>(p.apps||[]).includes(appName)).map(p=>p.name);
+}
+function featuresForPage(pageName){
+  return DATA.features.filter(f=>(f.surfaces||[]).includes(pageName)).map(f=>f.name);
+}
+function taskStatusAllowed(taskName){
+  const st = pdTaskStatusFor(taskName) || 'Not Started';
+  if(mapFilters.statuses.size && !mapFilters.statuses.has(st)) return false;
+  if(mapFilters.pd.size){
+    const pdTask = pdTaskByName[taskName];
+    const names = (pdTask && pdTask.pd) || [];
+    if(!names.some(n=>mapFilters.pd.has(n))) return false;
+  }
+  if(mapFilters.uxr.size){
+    const uxrNames = getTaskUxrAssignees(taskName);
+    if(!uxrNames.some(n=>mapFilters.uxr.has(n))) return false;
+  }
+  return true;
+}
+function closeFeatureBranch(featureName){
+  mapOpenFeatures.delete(featureName);
+}
+function closePageBranch(pageName){
+  mapOpenPages.delete(pageName);
+  featuresForPage(pageName).forEach(closeFeatureBranch);
+}
+function closeAppBranch(appName){
+  mapOpenApps.delete(appName);
+  pagesForApp(appName).forEach(closePageBranch);
+}
+function openAppBranch(appName){
+  mapOpenApps.add(appName);
+  pagesForApp(appName).forEach(pageName=>{
+    mapOpenPages.add(pageName);
+    featuresForPage(pageName).forEach(featureName=>mapOpenFeatures.add(featureName));
+  });
+}
+function openPageBranch(pageName){
+  mapOpenPages.add(pageName);
+  featuresForPage(pageName).forEach(featureName=>mapOpenFeatures.add(featureName));
+}
+function ensureMapNodeVisible(key){
+  if(!key) return;
+  const [type, name] = key.split(':');
+  if(type==='app'){
+    openAppBranch(name);
+    return;
+  }
+  if(type==='page'){
+    const page = pageByName[name];
+    (page && page.apps || []).forEach(openAppBranch);
+    openPageBranch(name);
+    return;
+  }
+  if(type==='feature'){
+    const feature = featureByName[name];
+    if(!feature) return;
+    DATA.pages.filter(p=>(feature.surfaces||[]).includes(p.name)).forEach(p=>{
+      (p.apps||[]).forEach(openAppBranch);
+      openPageBranch(p.name);
+    });
+    mapOpenFeatures.add(name);
+    return;
+  }
+  if(type==='task'){
+    taskAppNames(name).forEach(openAppBranch);
+    const feature = DATA.features.find(f=>(f.tasks||[]).includes(name));
+    if(feature){
+      mapOpenFeatures.add(feature.name);
+      DATA.pages
+        .filter(p=>(feature.surfaces||[]).includes(p.name))
+        .forEach(p=>openPageBranch(p.name));
+    }
+  }
+}
 
 function getTaskUxrAssignees(taskName){
   const pdTask = pdTaskByName[taskName] || pdTaskById[taskName];
@@ -1251,31 +1373,27 @@ function computeVisibleGraph(){
     return true;
   });
   const appNames = new Set(apps.map(a=>a.name));
+  const openAppNames = new Set([...mapOpenApps].filter(a=>appNames.has(a)));
 
   const pages = DATA.pages.filter(p=>{
     if(!(p.apps||[]).some(a=>appNames.has(a))) return false;
+    if(!(p.apps||[]).some(a=>openAppNames.has(a))) return false;
     if(mapFilters.pageTypes.size && !mapFilters.pageTypes.has(p.type)) return false;
     return true;
   });
   const pageNames = new Set(pages.map(p=>p.name));
+  const openPageNames = new Set([...mapOpenPages].filter(p=>pageNames.has(p)));
 
-  const features = DATA.features.filter(f=>(f.surfaces||[]).some(s=>pageNames.has(s)));
+  const features = DATA.features.filter(f=>(f.surfaces||[]).some(s=>openPageNames.has(s)));
+  const featureNames = new Set(features.map(f=>f.name));
+  const openFeatureNames = new Set([...mapOpenFeatures].filter(f=>featureNames.has(f)));
 
   const tasks = [];
   features.forEach(f=>{
+    if(!openFeatureNames.has(f.name)) return;
     (f.tasks||[]).forEach(tn=>{
-      const st = pdTaskStatusFor(tn) || 'Not Started';
-      if(mapFilters.statuses.size && !mapFilters.statuses.has(st)) return;
-      if(mapFilters.pd.size){
-        const pdTask = pdTaskByName[tn];
-        const names = (pdTask && pdTask.pd) || [];
-        if(!names.some(n=>mapFilters.pd.has(n))) return;
-      }
-      if(mapFilters.uxr.size){
-        const uxrNames = getTaskUxrAssignees(tn);
-        if(!uxrNames.some(n=>mapFilters.uxr.has(n))) return;
-      }
-      tasks.push({name:tn, feature:f.name, status:st});
+      if(!taskStatusAllowed(tn)) return;
+      tasks.push({name:tn, feature:f.name, status:pdTaskStatusFor(tn) || 'Not Started'});
     });
   });
 
@@ -1340,24 +1458,66 @@ function renderMindmap(){
     edgesHtml += `<path class="medge" data-a="${escAttr(a)}" data-b="${escAttr(b)}" d="${edgePath(pa,pb)}"></path>`;
   });
 
-  function chip(type, key, label, cls, count, style){
+  const visibleAppNames = new Set(mapGraph.apps.map(a=>a.name));
+  const visiblePagesForCounts = DATA.pages.filter(p=>{
+    if(!(p.apps||[]).some(a=>visibleAppNames.has(a))) return false;
+    if(mapFilters.pageTypes.size && !mapFilters.pageTypes.has(p.type)) return false;
+    return true;
+  });
+  const appChildCount = {};
+  visibleAppNames.forEach(name=>{ appChildCount[name] = 0; });
+  visiblePagesForCounts.forEach(p=>(p.apps||[]).forEach(a=>{ if(visibleAppNames.has(a)) appChildCount[a] = (appChildCount[a]||0) + 1; }));
+
+  const pageChildCount = {};
+  visiblePagesForCounts.forEach(p=>{ pageChildCount[p.name] = 0; });
+  const visibleFeaturesForCounts = DATA.features.filter(f=>(f.surfaces||[]).some(s=>Object.prototype.hasOwnProperty.call(pageChildCount, s)));
+  visibleFeaturesForCounts.forEach(f=>{
+    (f.surfaces||[]).forEach(s=>{
+      if(Object.prototype.hasOwnProperty.call(pageChildCount, s)) pageChildCount[s] += 1;
+    });
+  });
+
+  const featureChildCount = {};
+  visibleFeaturesForCounts.forEach(f=>{
+    featureChildCount[f.name] = (f.tasks||[]).filter(taskStatusAllowed).length;
+  });
+
+  function chip(type, key, displayLabel, rawName, cls, count, expandable, style){
     const p = mapLayout.positions[key];
     if(!p) return '';
     return `<foreignObject x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}">
-      <div xmlns="http://www.w3.org/1999/xhtml" class="mnode ${cls}" data-type="${type}" data-name="${escAttr(label)}" data-key="${escAttr(key)}" style="${style||''}">
-        <span class="mnode-label">${escapeHtml(label)}</span>
+      <div xmlns="http://www.w3.org/1999/xhtml" class="mnode ${cls}" data-type="${type}" data-name="${escAttr(rawName)}" data-key="${escAttr(key)}" data-expandable="${expandable?'true':'false'}" style="${style||''}">
+        <span class="mnode-label">${escapeHtml(displayLabel)}</span>
         ${count!=null?`<span class="mnode-count">${count}</span>`:''}
       </div>
     </foreignObject>`;
   }
 
   let nodesHtml = '';
-  mapLayout.sortedApps.forEach(a=>{ nodesHtml += chip('app', `app:${a.name}`, a.name, 'mnode-app', a.surfaces.length); });
-  mapLayout.sortedPages.forEach(p=>{ nodesHtml += chip('page', `page:${p.name}`, p.name, 'mnode-page', null); });
-  mapLayout.sortedFeatures.forEach(f=>{ nodesHtml += chip('feature', `feature:${f.name}`, f.name, 'mnode-feature', f.tasks.length||null); });
+  mapLayout.sortedApps.forEach(a=>{
+    const childCount = appChildCount[a.name] || 0;
+    const expandable = childCount > 0;
+    const isOpen = mapOpenApps.has(a.name);
+    const indicator = expandable ? (isOpen ? '\u25BE ' : '\u25B8 ') : '';
+    nodesHtml += chip('app', `app:${a.name}`, indicator + a.name, a.name, 'mnode-app', childCount || null, expandable);
+  });
+  mapLayout.sortedPages.forEach(p=>{
+    const childCount = pageChildCount[p.name] || 0;
+    const expandable = childCount > 0;
+    const isOpen = mapOpenPages.has(p.name);
+    const indicator = expandable ? (isOpen ? '\u25BE ' : '\u25B8 ') : '';
+    nodesHtml += chip('page', `page:${p.name}`, indicator + p.name, p.name, 'mnode-page', childCount || null, expandable);
+  });
+  mapLayout.sortedFeatures.forEach(f=>{
+    const childCount = featureChildCount[f.name] || 0;
+    const expandable = childCount > 0;
+    const isOpen = mapOpenFeatures.has(f.name);
+    const indicator = expandable ? (isOpen ? '\u25BE ' : '\u25B8 ') : '';
+    nodesHtml += chip('feature', `feature:${f.name}`, indicator + f.name, f.name, 'mnode-feature', childCount || null, expandable);
+  });
   mapLayout.sortedTasks.forEach(t=>{
     const s = statusDef(PD_STATUSES, t.status); const v = colorVars(s.color);
-    nodesHtml += chip('task', `task:${t.name}`, t.name, 'mnode-task', null, `background:${v.bg};border-color:${v.bd};color:${v.tx}`);
+    nodesHtml += chip('task', `task:${t.name}`, t.name, t.name, 'mnode-task', null, false, `background:${v.bg};border-color:${v.bd};color:${v.tx}`);
   });
 
   svg.innerHTML = edgesHtml + nodesHtml;
@@ -1422,14 +1582,38 @@ mmWrap.addEventListener('click', e=>{
   const node = e.target.closest('.mnode');
   if(!node){ mapHighlightKey=null; applyMapHighlight(); return; }
   const key = node.dataset.key;
+  const type = node.dataset.type, name = node.dataset.name;
+  const expandable = node.dataset.expandable === 'true';
+  if(type==='app'){
+    if(expandable){
+      if(mapOpenApps.has(name)) closeAppBranch(name);
+      else openAppBranch(name);
+      mapHighlightKey = null;
+      renderMindmap();
+      return;
+    }
+  }
+  if(type==='page'){
+    if(expandable){
+      if(mapOpenPages.has(name)) closePageBranch(name);
+      else openPageBranch(name);
+      mapHighlightKey = null;
+      renderMindmap();
+      return;
+    }
+  }
+  if(type==='feature'){
+    if(expandable){
+      if(mapOpenFeatures.has(name)) closeFeatureBranch(name);
+      else mapOpenFeatures.add(name);
+      mapHighlightKey = null;
+      renderMindmap();
+      return;
+    }
+  }
   if(mapHighlightKey===key){ mapHighlightKey=null; applyMapHighlight(); return; }
   mapHighlightKey = key;
   applyMapHighlight();
-  const type = node.dataset.type, name = node.dataset.name;
-  if(type==='app') openDetail('app', name);
-  else if(type==='page') openDetail('page', name);
-  else if(type==='feature') openDetail('feature', name);
-  else if(type==='task') openPdCardDetail(name);
 });
 
 function setMapZoom(z){
@@ -1537,6 +1721,7 @@ function goToMapNode(key){
     Object.values(mapFilters).forEach(s=>s.clear());
     renderMapFilterPanel();
   }
+  ensureMapNodeVisible(key);
   renderMindmap();
   const pos = mapLayout.positions[key];
   if(!pos) return;
@@ -1676,8 +1861,7 @@ function renderBoard(board){
       el.querySelectorAll('.col').forEach(col=>col.classList.remove('drop-disabled'));
     });
     card.addEventListener('click', ()=>{
-      if(board==='pd') openPdCardDetail(card.dataset.id);
-      else openUxrCardDetail(card.dataset.id);
+      editTask(board, card.dataset.id);
     });
   });
   el.querySelectorAll('.col').forEach(col=>{
@@ -1703,7 +1887,9 @@ function renderBoard(board){
 
 function cardHtml(board, t){
   const overdue = isOverdue(t.estDate, t.status);
-  const statusesAttr = t.applicableStatuses ? ` data-statuses="${escAttr(t.applicableStatuses.join('|'))}"` : '';
+  const fullStatuses = (board==='pd' ? PD_STATUSES : UXR_STATUSES).map(s=>s.id);
+  const allowed = t.allowedStatuses || normalizeAllowedStatuses(board, t.applicableStatuses || null);
+  const statusesAttr = allowed.length===fullStatuses.length ? '' : ` data-statuses="${escAttr(allowed.join('|'))}"`;
   if(board==='pd'){
     return `<div class="kcard" draggable="true" data-id="${escAttr(t.id)}"${statusesAttr}>
       ${t.appName?`<div class="kc-app">${escapeHtml(t.appName)}</div>`:''}
@@ -1741,6 +1927,10 @@ function historyHtml(history){
 function openPdCardDetail(id){
   const t = getAllPdTasks().find(x=>x.id===id); if(!t) return;
   const v = colorVars(statusDef(PD_STATUSES, t.status).color);
+  const enabledOptional = getEnabledPdOptionalStatuses(t);
+  const optionalMsg = enabledOptional.length===PD_CREATION_STATUSES.length
+    ? ''
+    : `Optional statuses enabled: ${enabledOptional.length ? enabledOptional.map(escapeHtml).join(', ') : 'none'}`;
   openDrawer(`
     <div class="d-type">PD Task${t.custom?' · custom':''}</div>
     <h2>${escapeHtml(t.title)}</h2>
@@ -1753,11 +1943,11 @@ function openPdCardDetail(id){
       <div class="status-select-row">
         ${PD_STATUSES.map(s=>{
           const vv = colorVars(s.color);
-          const allowed = !t.applicableStatuses || t.applicableStatuses.includes(s.id);
+          const allowed = (t.allowedStatuses || normalizeAllowedStatuses('pd', t.applicableStatuses || null)).includes(s.id);
           return `<button class="status-pill ${s.id===t.status?'selected':''} ${allowed?'':'pill-disabled'}" style="background:${vv.bg};border-color:${vv.bd};color:${vv.tx}" ${allowed?`onclick="moveTask('pd','${escAttr(t.id)}','${escAttr(s.id)}')"`:'disabled'}>${escapeHtml(s.id)}</button>`;
         }).join('')}
       </div>
-      ${t.applicableStatuses?`<div class="d-empty" style="margin-top:6px">This task only uses: ${t.applicableStatuses.map(escapeHtml).join(', ')}</div>`:''}
+      ${optionalMsg?`<div class="d-empty" style="margin-top:6px">${optionalMsg}</div>`:''}
     </div>
     ${t.featureName?`<div class="d-section"><h5>Feature</h5><div class="d-list">${featureByName[t.featureName]?linkItemAndClose('feature',t.featureName):`<span class="d-empty">${escapeHtml(t.featureName)}</span>`}</div></div>`:''}
     ${t.pages && t.pages.length?`<div class="d-section"><h5>Pages</h5><div class="d-list">${t.pages.map(p=>pageByName[p]?linkItemAndClose('page',p):`<span class="d-empty">${escapeHtml(p)}</span>`).join('')}</div></div>`:''}
@@ -1802,8 +1992,10 @@ function linkItemAndClose(type,name){
   return `<div class="d-link-item" onclick="closeDrawer();setTimeout(()=>openDetail('${type}','${escAttr(name)}'),160)"><span>${escapeHtml(name)}</span></div>`;
 }
 async function deleteTask(board, id){
+  const task = board==='pd' ? getAllPdTasks().find(x=>x.id===id) : getAllUxrTasks().find(x=>x.id===id);
+  if(!task) return;
+  if(!window.confirm(`Delete "${task.title}"? This cannot be undone.`)) return;
   if(board==='pd'){
-    const task = getAllPdTasks().find(x=>x.id===id);
     pdBoardState.tasksCustom = (pdBoardState.tasksCustom||[]).filter(t=>t.id!==id);
     const baseIdx = DATA.pdTasks.findIndex(t=>(t.id||t.name)===id);
     if(baseIdx>=0){
@@ -1836,6 +2028,31 @@ function editTask(board, id){
   const apps = DATA.apps.map(a=>`<option value="${escAttr(a.name)}" ${task.appName===a.name?'selected':''}>${escapeHtml(a.name)}</option>`).join('');
   const feats = DATA.features.map(f=>`<option value="${escAttr(f.name)}" ${task.featureName===f.name?'selected':''}>${escapeHtml(f.name)}</option>`).join('');
   const pdOpts = getAllPdTasks().map(t=>`<option value="${escAttr(t.id)}" ${(task.parentPdTask===t.id || task.parentPdTask===t.title)?'selected':''}>${escapeHtml(t.title)}</option>`).join('');
+  const pdAllowedStatuses = task.allowedStatuses || normalizeAllowedStatuses('pd', task.applicableStatuses || null);
+  const editableStatuses = (board==='pd' ? PD_STATUSES.map(s=>s.id).filter(id=>pdAllowedStatuses.includes(id)) : UXR_STATUSES.map(s=>s.id));
+  const statusOptions = editableStatuses.map(st=>`<option value="${escAttr(st)}" ${st===task.status?'selected':''}>${escapeHtml(st)}</option>`).join('');
+  const linkedFeatures = board==='pd' ? DATA.features.filter(f=>(f.tasks||[]).includes(task.title)) : [];
+  const directPages = board==='pd' ? DATA.pages.filter(p=>(p.tasks||[]).includes(task.title)) : [];
+  const viaFeaturePages = board==='pd' && task.featureName ? DATA.pages.filter(p=>(p.features||[]).includes(task.featureName)) : [];
+  const pageLinkMap = {};
+  directPages.forEach(p=>{ pageLinkMap[p.name] = ['direct task link']; });
+  viaFeaturePages.forEach(p=>{
+    pageLinkMap[p.name] = pageLinkMap[p.name] || [];
+    if(!pageLinkMap[p.name].includes('via feature "'+task.featureName+'"')) pageLinkMap[p.name].push('via feature "'+task.featureName+'"');
+  });
+  const linkedPages = Object.keys(pageLinkMap).sort();
+  const linkedSummary = board==='pd'
+    ? `<div class="field"><label>Linked items</label>
+         <div class="d-empty">${linkedFeatures.length} feature(s) · ${linkedPages.length} page(s)</div>
+         <button id="et_links_toggle" class="btn ghost small" type="button" style="padding:0;border:none;background:none;color:var(--accent)">See all</button>
+         <div id="et_links_detail" style="display:none;margin-top:8px">
+           <div class="d-empty"><b>Features</b></div>
+           ${linkedFeatures.length ? `<div class="d-list">${linkedFeatures.map(f=>`<div class="d-link-item" style="cursor:default"><span>${escapeHtml(f.name)}</span><span class="d-empty">direct task link</span></div>`).join('')}</div>` : '<div class="d-empty">No linked features</div>'}
+           <div class="d-empty" style="margin-top:8px"><b>Pages</b></div>
+           ${linkedPages.length ? `<div class="d-list">${linkedPages.map(name=>`<div class="d-link-item" style="cursor:default"><span>${escapeHtml(name)}</span><span class="d-empty">${escapeHtml(pageLinkMap[name].join(' + '))}</span></div>`).join('')}</div>` : '<div class="d-empty">No linked pages</div>'}
+         </div>
+       </div>`
+    : '';
   openModal(`
     <h3>Edit ${board.toUpperCase()} task</h3>
     <div class="field"><label>Task name</label><input id="et_title" value="${escAttr(task.title)}"></div>
@@ -1845,14 +2062,31 @@ function editTask(board, id){
     }
     <div class="field"><label>Assignee</label><input id="et_assignee" value="${escAttr(task.assignee||'')}"></div>
     <div class="field"><label>Estimated date</label><input id="et_date" type="date" value="${escAttr(task.estDate||'')}"></div>
+    <div class="field"><label>Status</label><select id="et_status">${statusOptions}</select></div>
+    ${linkedSummary}
     <div class="modal-actions">
+      <button class="btn ghost" id="et_delete" type="button">Delete task</button>
       <button class="btn ghost" onclick="closeModal()">Cancel</button>
       <button class="btn primary" id="et_save">Save</button>
     </div>
   `);
+  const linksToggle = document.getElementById('et_links_toggle');
+  if(linksToggle){
+    linksToggle.addEventListener('click', ()=>{
+      const detail = document.getElementById('et_links_detail');
+      const open = detail.style.display!=='none';
+      detail.style.display = open ? 'none' : 'block';
+      linksToggle.textContent = open ? 'See all' : 'Hide breakdown';
+    });
+  }
+  document.getElementById('et_delete').addEventListener('click', async ()=>{
+    closeModal();
+    await deleteTask(board, id);
+  });
   document.getElementById('et_save').addEventListener('click', async ()=>{
     const title = document.getElementById('et_title').value.trim();
     if(!title){ showToast('Task name is required'); return; }
+    const status = document.getElementById('et_status').value;
     if(board==='pd'){
       const base = DATA.pdTasks.find(t=>(t.id||t.name)===id);
       const custom = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
@@ -1875,6 +2109,7 @@ function editTask(board, id){
         custom.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
         custom.estDate = document.getElementById('et_date').value;
       }
+      syncTaskStatus(pdBoardState, id, status);
       await storageSet('pd-board-state', pdBoardState);
     } else {
       const base = (DATA.uxrSeedTasks||[]).find(t=>(t.id||t.name)===id);
@@ -1891,6 +2126,7 @@ function editTask(board, id){
         custom.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
         custom.estDate = document.getElementById('et_date').value;
       }
+      syncTaskStatus(uxrBoardState, id, status);
       await storageSet('uxr-board-state', uxrBoardState);
     }
     await savePortalData();
@@ -1917,19 +2153,18 @@ document.getElementById('modalBackdrop').addEventListener('click', e=>{ if(e.tar
 
 function openAddPdModal(presetStatus){
   const apps = DATA.apps.map(a=>`<option value="${escAttr(a.name)}">${escapeHtml(a.name)}</option>`).join('');
-  const feats = DATA.features.map(f=>`<option value="${escAttr(f.name)}">${escapeHtml(f.name)}</option>`).join('');
-  const statuses = PD_STATUSES.map(s=>`<option value="${escAttr(s.id)}" ${s.id===presetStatus?'selected':''}>${escapeHtml(s.id)}</option>`).join('');
-  const statusChecks = PD_STATUSES.map(s=>`<label class="status-check"><input type="checkbox" value="${escAttr(s.id)}" checked> ${escapeHtml(s.id)}</label>`).join('');
+  const statusChecks = PD_CREATION_STATUSES.map(s=>`<label class="status-check"><input type="checkbox" value="${escAttr(s)}" checked> ${escapeHtml(s)}</label>`).join('');
   openModal(`
     <h3>New PD task</h3>
-    <div class="field"><label>Task name</label><input id="f_title" placeholder="e.g. CST_New Onboarding Flow"></div>
-    <div class="field"><label>App</label><select id="f_app"><option value="">—</option>${apps}</select></div>
-    <div class="field"><label>Feature</label><select id="f_feature"><option value="">—</option>${feats}</select></div>
+    <div class="d-empty" style="margin-bottom:8px">Fields marked with * are required.</div>
+    <div class="field"><label>App *</label><select id="f_app"><option value="">—</option>${apps}</select></div>
+    <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. New Onboarding Flow"></div>
+    <div class="field"><label>Feature</label><select id="f_feature"><option value="">—</option></select></div>
     <div class="field"><label>Assignee</label><input id="f_assignee" placeholder="e.g. Nancy Haddad"></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
-    <div class="field"><label>Starting status</label><select id="f_status">${statuses}</select></div>
     <div class="field">
-      <label>Statuses this task uses</label>
+      <label>Optional statuses this task uses</label>
+      <div class="d-empty">All other statuses always apply to every task.</div>
       <div class="status-checks" id="f_statuses">${statusChecks}</div>
     </div>
     <div class="modal-actions">
@@ -1937,17 +2172,32 @@ function openAddPdModal(presetStatus){
       <button class="btn primary" id="f_submit">Add task</button>
     </div>
   `);
+  const appSelect = document.getElementById('f_app');
+  const featureSelect = document.getElementById('f_feature');
+  function renderFeatureOptions(){
+    const selectedApp = appSelect.value;
+    const options = DATA.features
+      .filter(f=>!selectedApp || (f.apps||[]).includes(selectedApp))
+      .map(f=>`<option value="${escAttr(f.name)}">${escapeHtml(f.name)}</option>`)
+      .join('');
+    featureSelect.innerHTML = `<option value="">—</option>` + options;
+  }
+  appSelect.addEventListener('change', renderFeatureOptions);
+  renderFeatureOptions();
   document.getElementById('f_submit').addEventListener('click', ()=>{
     const title = document.getElementById('f_title').value.trim();
     if(!title){ showToast('Give the task a name first'); return; }
+    const appName = document.getElementById('f_app').value;
+    if(!appName){ showToast('Pick an app first'); return; }
     const checked = Array.from(document.querySelectorAll('#f_statuses input:checked')).map(cb=>cb.value);
-    const status = document.getElementById('f_status').value;
-    if(checked.length===0){ showToast('Pick at least one status this task uses'); return; }
-    if(!checked.includes(status)){ showToast('The starting status must be one of the checked statuses'); return; }
+    const fullStatusList = PD_STATUSES.map(s=>s.id);
+    const alwaysStatuses = fullStatusList.filter(s=>!PD_CREATION_STATUSES.includes(s));
+    const allowedStatuses = alwaysStatuses.concat(checked);
     addPdTask({
-      title, appName: document.getElementById('f_app').value, featureName: document.getElementById('f_feature').value,
+      title, appName, featureName: document.getElementById('f_feature').value,
       assignee: document.getElementById('f_assignee').value.trim(), estDate: document.getElementById('f_date').value,
-      status, applicableStatuses: checked.length===PD_STATUSES.length ? null : checked
+      status:'Not Started',
+      applicableStatuses: allowedStatuses.length===fullStatusList.length ? null : allowedStatuses
     });
     closeModal();
   });
@@ -1955,15 +2205,14 @@ function openAddPdModal(presetStatus){
 
 function openAddUxrModal(presetStatus){
   const pdOptions = getAllPdTasks().map(t=>`<option value="${escAttr(t.id)}">${escapeHtml(t.title)}</option>`).join('');
-  const statuses = UXR_STATUSES.map(s=>`<option value="${escAttr(s.id)}" ${s.id===presetStatus?'selected':''}>${escapeHtml(s.id)}</option>`).join('');
   const statusChecks = UXR_STATUSES.map(s=>`<label class="status-check"><input type="checkbox" value="${escAttr(s.id)}" checked> ${escapeHtml(s.id)}</label>`).join('');
   openModal(`
     <h3>New UXR task</h3>
-    <div class="field"><label>Task name</label><input id="f_title" placeholder="e.g. UXR_Checkout Friction Study"></div>
+    <div class="d-empty" style="margin-bottom:8px">Fields marked with * are required.</div>
+    <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. UXR_Checkout Friction Study"></div>
     <div class="field"><label>Linked PD task</label><select id="f_parent"><option value="">—</option>${pdOptions}</select></div>
     <div class="field"><label>Assignee</label><input id="f_assignee" placeholder="e.g. Rana Khalil"></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
-    <div class="field"><label>Starting status</label><select id="f_status">${statuses}</select></div>
     <div class="field">
       <label>Statuses this task uses</label>
       <div class="status-checks" id="f_statuses">${statusChecks}</div>
@@ -1977,13 +2226,11 @@ function openAddUxrModal(presetStatus){
     const title = document.getElementById('f_title').value.trim();
     if(!title){ showToast('Give the task a name first'); return; }
     const checked = Array.from(document.querySelectorAll('#f_statuses input:checked')).map(cb=>cb.value);
-    const status = document.getElementById('f_status').value;
     if(checked.length===0){ showToast('Pick at least one status this task uses'); return; }
-    if(!checked.includes(status)){ showToast('The starting status must be one of the checked statuses'); return; }
     addUxrTask({
       title, parentPdTask: document.getElementById('f_parent').value,
       assignee: document.getElementById('f_assignee').value.trim(), estDate: document.getElementById('f_date').value,
-      status, applicableStatuses: checked.length===UXR_STATUSES.length ? null : checked
+      status:'Not Started', applicableStatuses: checked.length===UXR_STATUSES.length ? null : checked
     });
     closeModal();
   });
@@ -1995,7 +2242,7 @@ function openAddModal(board, presetStatus){
 window.openAddModal = openAddModal;
 
 document.getElementById('addTaskBtn').addEventListener('click', ()=>{
-  openAddModal(activeBoard, 'Not Started');
+  openAddModal(activeBoard, activeBoard==='pd' ? 'Research' : 'Not Started');
 });
 
 /* ============================================================

@@ -414,7 +414,7 @@ table.tstat tr:last-child td{border-bottom:none;}
 .mindmap-empty{position:absolute;inset:0;align-items:center;justify-content:center;color:var(--ink-faint);font-size:13px;background:var(--surface);}
 
 .mnode{
-  display:flex;align-items:center;gap:6px;height:32px;padding:0 11px;border-radius:9px;
+  display:flex;align-items:center;gap:6px;height:32px;width:100%;padding:0 11px;border-radius:9px;
   border:1.5px solid var(--line-strong);background:var(--surface);font-size:12px;font-weight:600;
   cursor:pointer;box-sizing:border-box;overflow:hidden;white-space:nowrap;transition:opacity .15s,box-shadow .15s;
 }
