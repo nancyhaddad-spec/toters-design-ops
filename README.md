@@ -20,6 +20,27 @@ Then open:
 - `http://localhost:8080/design_ops_portal.html` (single-file mode), or
 - `http://localhost:8080/dashboard.html` (or any other page file).
 
+## Sheet Sync Backend (optional, recommended)
+
+Run this in a second terminal from the same folder:
+
+```bash
+node sheet-sync-backend.js
+```
+
+Backend endpoints:
+- `GET http://localhost:8787/health`
+- `GET http://localhost:8787/api/pd-sheet/status`
+- `GET http://localhost:8787/api/pd-sheet/tasks`
+- `POST http://localhost:8787/api/pd-sheet/sync`
+- `POST http://localhost:8787/api/pd-sheet/webhook` (optional; protect with `SHEET_SYNC_SECRET`).
+
+Environment variables (optional):
+- `SHEET_SYNC_PORT` (default `8787`)
+- `SHEET_SYNC_PROJECT_DIR` (defaults to the backend file's folder)
+- `SHEET_SYNC_SECRET` (for webhook auth header `x-sync-secret`)
+- `SHEET_SYNC_POLL_MS` (default `15000`)
+
 ## Routing Behavior
 
 - **Single-file mode** (`design_ops_portal.html`):

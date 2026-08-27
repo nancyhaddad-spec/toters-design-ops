@@ -60,7 +60,6 @@ window.PORTAL_MULTI_FILE = window.PORTAL_MULTI_FILE || false;
       </button>
     </nav>
     <div class="sidebar-foot">
-      <div class="sync-note">Task statuses and history are stored live for the whole team — changes sync across everyone viewing this portal.</div>
       <div class="who">
         <div class="avatar" id="whoAvatar">NH</div>
         <div><b id="whoName">Nancy Haddad</b><span id="whoEmail">Product Designer</span></div>
@@ -246,25 +245,30 @@ window.PORTAL_MULTI_FILE = window.PORTAL_MULTI_FILE || false;
 
     <!-- ===================== BOARDS (PD + UXR combined) ===================== -->
     <section class="page" id="page-boards">
-      <div class="page-head">
+      <div class="page-head board-page-head">
         <div>
-          <h1>Task Boards</h1>
+          <div class="board-title-row">
+            <h1>Task Boards</h1>
+            <div class="board-sync-pill warn" id="boardSyncPill">Backend… · Syncing…</div>
+          </div>
           <p id="boardSubtitle">Product design tasks, tracked through the 8-stage design workflow. Drag a card between columns to update its status.</p>
         </div>
-        <div class="head-actions">
-          <button class="btn small" id="viewLogBtn">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
-            Movement log
-          </button>
-          <button class="btn primary small" id="addTaskBtn">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>
-            New task
-          </button>
+        <div class="head-actions board-head-actions">
+          <div class="head-actions-row">
+            <div class="subtabs board-toggle" id="boardSubtabs">
+              <button class="subtab-btn active" data-board="pd">PD Board</button>
+              <button class="subtab-btn" data-board="uxr">UXR Board</button>
+            </div>
+            <button class="btn small" id="viewLogBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+              Movement log
+            </button>
+            <button class="btn primary small" id="addTaskBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>
+              New task
+            </button>
+          </div>
         </div>
-      </div>
-      <div class="subtabs" id="boardSubtabs">
-        <button class="subtab-btn active" data-board="pd">PD Board</button>
-        <button class="subtab-btn" data-board="uxr">UXR Board</button>
       </div>
       <div class="board-filters" id="boardFilters">
         <div class="filter-field">

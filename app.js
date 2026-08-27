@@ -66,6 +66,25 @@ function fmtDate(iso){
   if(isNaN(d)) return iso;
   return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
 }
+function toIsoDate(value){
+  if(!value) return '';
+  const raw = String(value).trim();
+  if(!raw) return '';
+  const gvizMatch = raw.match(/^Date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})/);
+  if(gvizMatch){
+    const y = Number(gvizMatch[1]);
+    const m = Number(gvizMatch[2]) + 1;
+    const d = Number(gvizMatch[3]);
+    return `${String(y).padStart(4,'0')}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  if(/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const d = new Date(raw);
+  if(isNaN(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
 function relTime(iso){
   const now = Date.now(); const t = new Date(iso).getTime();
   const diff = Math.max(0, now-t);
@@ -96,6 +115,889 @@ function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&
 const SHARED = true;
 let pdBoardState = {tasksCustom:[], states:{}};
 let uxrBoardState = {tasksCustom:[], states:{}};
+const PD_SHEET_ID = '12wMk4KqtNY9gQRiWAKpo_O6DSQupgfxYrwZRxAkhYUw';
+const PD_SHEET_PUBLISHED_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQHKlD0KVJe1qVSwVoFDPffnRsYHeZ24aZ3BpwDHpWCWvaRkIKM2VpPsoeWQpm0zITMYG9Oud9tvPZ8/pubhtml';
+const PD_SHEET_CSV_URLS = [
+  `https://docs.google.com/spreadsheets/d/${PD_SHEET_ID}/gviz/tq?tqx=out:csv`,
+  `https://docs.google.com/spreadsheets/d/${PD_SHEET_ID}/export?format=csv`
+];
+const PD_SHEET_GVIZ_JSONP_URL = `https://docs.google.com/spreadsheets/d/${PD_SHEET_ID}/gviz/tq?tqx=out:json`;
+const PD_LOCAL_CSV_URLS = ['./pd-sheet.csv', './pd_tasks_sheet.csv'];
+const PD_SHEET_POLL_MS = 15000;
+const PD_SHEET_BACKEND_URL = 'http://localhost:8787';
+const TOTERS_EMAIL_DOMAIN = 'totersapp.com';
+const PD_SHEET_REQUIRED_FIELDS = [
+  {key:'title', label:'Request Title'},
+  {key:'appName', label:'Application'},
+  {key:'productDesigner', label:'Product Designer'},
+  {key:'productManager', label:'Product Manager'}
+];
+const PD_REQUIRED_FIELD_HINT = 'Required fields: Task Name, Application, Product Designer, Product Manager.';
+let pdSheetSyncTimer = null;
+let pdSheetSyncRunning = false;
+let pdSheetLastErrorAt = 0;
+let pdSheetLastErrorMsg = '';
+let pdSheetLastSignature = '';
+let pdSheetLastSyncedAt = 0;
+let pdSheetLastStatus = 'idle'; // idle | ok | warn | err
+let pdSheetLastStatusText = 'Sheet sync: waiting…';
+let pdBackendState = 'checking'; // checking | connected | disconnected
+const totersPeopleByEmail = new Map();
+
+function renderSheetSyncBadge(){
+  renderBoardSyncPill();
+}
+function renderBackendIndicator(){
+  renderBoardSyncPill();
+}
+function renderBoardSyncPill(){
+  const el = document.getElementById('boardSyncPill');
+  if(!el) return;
+  el.classList.remove('ok','warn','err');
+  const backendLabel = pdBackendState==='connected'
+    ? 'Backend on'
+    : pdBackendState==='disconnected'
+      ? 'Backend off'
+      : 'Backend…';
+  let syncLabel = 'Syncing…';
+  if(pdSheetLastStatus==='ok'){
+    const t = pdSheetLastSyncedAt ? new Date(pdSheetLastSyncedAt).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) : '';
+    syncLabel = t ? `Synced ${t}` : 'Synced';
+  }else if(pdSheetLastStatus==='err'){
+    syncLabel = 'Sync error';
+  }else if(pdSheetLastStatus==='warn'){
+    syncLabel = 'Sync warning';
+  }
+  if(pdBackendState==='disconnected' || pdSheetLastStatus==='err'){
+    el.classList.add('err');
+  }else if(pdBackendState==='checking' || pdSheetLastStatus==='warn' || pdSheetLastStatus==='idle'){
+    el.classList.add('warn');
+  }else{
+    el.classList.add('ok');
+  }
+  el.textContent = `${backendLabel} · ${syncLabel}`;
+  const titleText = pdSheetLastStatusText || 'Sheet sync: waiting…';
+  el.title = `${backendLabel} · ${titleText}`;
+}
+function missingRequiredFieldsForSheetTask(taskLike){
+  return PD_SHEET_REQUIRED_FIELDS
+    .filter(f=>!String(taskLike[f.key] || '').trim())
+    .map(f=>f.label);
+}
+function auditSheetTaskRequiredFieldsInState(){
+  const customTasks = pdBoardState.tasksCustom || [];
+  let changed = false;
+  customTasks.forEach(task=>{
+    if(task.source!=='sheet') return;
+    const nextMissing = missingRequiredFieldsForSheetTask({
+      title: task.title,
+      appName: task.appName,
+      productDesigner: task.productDesigner || task.assignee || '',
+      productManager: task.productManager || ''
+    });
+    if(JSON.stringify(task.missingRequiredFields||[])!==JSON.stringify(nextMissing)){
+      task.missingRequiredFields = nextMissing;
+      changed = true;
+    }
+  });
+  return changed;
+}
+function isTotersEmail(v){
+  const email = String(v||'').trim().toLowerCase();
+  return !!email && email.endsWith('@'+TOTERS_EMAIL_DOMAIN) && email.includes('@');
+}
+function normalizePersonEmail(v){
+  return String(v||'').trim().toLowerCase();
+}
+function normalizePeopleCsv(raw){
+  const seen = new Set();
+  const out = [];
+  String(raw||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(v=>{
+    const key = String(v).toLowerCase();
+    if(seen.has(key)) return;
+    seen.add(key);
+    out.push(v);
+  });
+  return out.join(', ');
+}
+function upsertTotersPerson(profile){
+  const email = normalizePersonEmail(profile && profile.email);
+  if(!isTotersEmail(email)) return;
+  const current = totersPeopleByEmail.get(email) || {email, name:'', image:''};
+  const nextName = String(profile && profile.name || '').trim();
+  const nextImage = String(profile && profile.image || '').trim();
+  if(nextName) current.name = nextName;
+  if(nextImage) current.image = nextImage;
+  totersPeopleByEmail.set(email, current);
+}
+function mergeTotersPeopleDirectory(list){
+  if(!Array.isArray(list)) return;
+  list.forEach(upsertTotersPerson);
+}
+function personProfileByEmail(email){
+  return totersPeopleByEmail.get(normalizePersonEmail(email)) || null;
+}
+function parseTotersPeople(raw){
+  const list = normalizePeopleCsv(raw).split(',').map(x=>x.trim()).filter(Boolean);
+  const invalid = list.filter(v=>!isTotersEmail(v));
+  return {list, invalid, ok: invalid.length===0};
+}
+function emailToDisplayName(email){
+  const normalized = normalizePersonEmail(email);
+  if(!isTotersEmail(normalized)) return String(email||'').trim() || 'Unassigned';
+  const person = personProfileByEmail(normalized);
+  if(person && person.name) return person.name;
+  const local = normalized.split('@')[0];
+  return local.replace(/[._-]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+}
+function peopleDisplayPrimary(raw){
+  const first = splitPeople(raw)[0];
+  return first ? emailToDisplayName(first) : 'Unassigned';
+}
+function splitPeople(raw){
+  return normalizePeopleCsv(raw).split(',').map(x=>x.trim()).filter(Boolean);
+}
+function peopleFilterKey(raw){
+  return normalizeCol(emailToDisplayName(raw));
+}
+function collectTotersDirectory(){
+  const entries = new Map();
+  function add(raw, hint){
+    splitPeople(raw).forEach(p=>{
+      const email = normalizePersonEmail(p);
+      if(!isTotersEmail(email)) return;
+      const profile = personProfileByEmail(email) || {};
+      const base = entries.get(email) || {email, name:'', image:''};
+      base.name = profile.name || hint || base.name || emailToDisplayName(email);
+      base.image = profile.image || base.image || '';
+      entries.set(email, base);
+    });
+  }
+  DATA.pdTasks.forEach(t=>{
+    add(t.productDesigner || (Array.isArray(t.pd) ? t.pd.join(',') : ''), Array.isArray(t.pd) ? t.pd[0] : '');
+    add(t.productManager || '');
+    add(t.engineers || '');
+  });
+  (DATA.uxrSeedTasks||[]).forEach(t=>{
+    add(t.productDesigner || t.assignee || '');
+    add(t.productManager || '');
+    add(t.engineers || '');
+  });
+  getAllPdTasks().forEach(t=>{
+    add(t.productDesigner || t.assignee || '');
+    add(t.productManager || '');
+    add(t.engineers || '');
+  });
+  getAllUxrTasks().forEach(t=>{
+    add(t.productDesigner || t.assignee || '');
+    add(t.productManager || '');
+    add(t.engineers || '');
+  });
+  const currentSignedInEmail = (document.getElementById('whoEmail')?.textContent || '').trim().toLowerCase();
+  if(isTotersEmail(currentSignedInEmail)) add(currentSignedInEmail);
+  totersPeopleByEmail.forEach((profile, email)=>{
+    if(isTotersEmail(email)){
+      const base = entries.get(email) || {email, name:'', image:''};
+      base.name = profile.name || base.name || emailToDisplayName(email);
+      base.image = profile.image || base.image || '';
+      entries.set(email, base);
+    }
+  });
+  return [...entries.values()].sort((a,b)=>a.name.localeCompare(b.name));
+}
+function getPeopleSuggestions(query, directory, limit=8){
+  const q = String(query||'').trim().toLowerCase();
+  const matches = directory.filter(p=>{
+    if(!q) return true;
+    return p.email.toLowerCase().includes(q) || p.name.toLowerCase().includes(q);
+  });
+  return matches.slice(0, limit);
+}
+function tokenRangeForPeople(value, caret){
+  const safeValue = String(value||'');
+  const pos = Number.isFinite(caret) ? caret : safeValue.length;
+  const left = safeValue.slice(0, pos);
+  const right = safeValue.slice(pos);
+  const tokenStart = left.lastIndexOf(',') + 1;
+  const nextComma = right.indexOf(',');
+  const tokenEnd = nextComma===-1 ? safeValue.length : pos + nextComma;
+  return {tokenStart, tokenEnd, token: safeValue.slice(tokenStart, tokenEnd).trim()};
+}
+function attachPeopleAutocomplete(inputId){
+  const input = document.getElementById(inputId);
+  if(!input) return;
+  const field = input.closest('.field') || input.parentElement;
+  if(!field) return;
+  const directory = collectTotersDirectory();
+  const menu = document.createElement('div');
+  menu.className = 'people-suggest-menu';
+  menu.style.display = 'none';
+  field.appendChild(menu);
+  let activeItems = [];
+  let activeIdx = -1;
+  function hideMenu(){
+    menu.style.display = 'none';
+    menu.innerHTML = '';
+    activeItems = [];
+    activeIdx = -1;
+  }
+  function applySuggestion(email){
+    const range = tokenRangeForPeople(input.value, input.selectionStart);
+    let before = input.value.slice(0, range.tokenStart).replace(/\s*$/, '');
+    if(before && before.endsWith(',')) before += ' ';
+    const after = input.value.slice(range.tokenEnd);
+    input.value = before + email + after;
+    const nextPos = (before + email).length;
+    input.setSelectionRange(nextPos, nextPos);
+    hideMenu();
+    input.dispatchEvent(new Event('input', {bubbles:true}));
+  }
+  function renderMenu(){
+    const range = tokenRangeForPeople(input.value, input.selectionStart);
+    const items = getPeopleSuggestions(range.token, directory);
+    if(!items.length){ hideMenu(); return; }
+    activeItems = items;
+    if(activeIdx >= items.length) activeIdx = 0;
+    menu.innerHTML = items.map((p,i)=>`<button type="button" class="people-suggest-item ${i===activeIdx?'active':''}" data-email="${escAttr(p.email)}">${p.image ? `<img src="${escapeHtml(p.image)}" alt="${escAttr(p.name || p.email)}" onerror="this.remove()">` : ''}<div><span>${escapeHtml(p.name)}</span><small>${escapeHtml(p.email)}</small></div></button>`).join('');
+    menu.style.display = 'block';
+    menu.querySelectorAll('.people-suggest-item').forEach(btn=>{
+      btn.addEventListener('mousedown', e=>{ e.preventDefault(); });
+      btn.addEventListener('click', ()=>applySuggestion(btn.dataset.email));
+    });
+  }
+  input.addEventListener('focus', renderMenu);
+  input.addEventListener('click', renderMenu);
+  input.addEventListener('input', ()=>{ activeIdx = -1; renderMenu(); });
+  input.addEventListener('keydown', e=>{
+    if(menu.style.display==='none') return;
+    if(e.key==='ArrowDown'){
+      e.preventDefault();
+      activeIdx = (activeIdx + 1 + activeItems.length) % activeItems.length;
+      renderMenu();
+    } else if(e.key==='ArrowUp'){
+      e.preventDefault();
+      activeIdx = (activeIdx - 1 + activeItems.length) % activeItems.length;
+      renderMenu();
+    } else if(e.key==='Enter'){
+      if(activeIdx>=0 && activeItems[activeIdx]){
+        e.preventDefault();
+        applySuggestion(activeItems[activeIdx].email);
+      }
+    } else if(e.key==='Escape'){
+      hideMenu();
+    }
+  });
+  input.addEventListener('blur', ()=>setTimeout(hideMenu, 120));
+}
+function enablePeopleFieldAutocomplete(ids){
+  ids.forEach(id=>attachPeopleAutocomplete(id));
+}
+function personAvatarHtml(email, fallbackLabel){
+  const profile = personProfileByEmail(email);
+  const label = fallbackLabel || emailToDisplayName(email);
+  if(profile && profile.image){
+    return `<div class="kc-avatar has-img"><img src="${escapeHtml(profile.image)}" alt="${escAttr(label)}" onerror="this.remove();this.parentElement.classList.add('img-fallback')"><span>${initials(label)}</span></div>`;
+  }
+  return `<div class="kc-avatar">${initials(label)}</div>`;
+}
+function peopleListHtml(raw){
+  const people = String(raw||'').split(',').map(x=>x.trim()).filter(Boolean);
+  if(!people.length) return '<span class="d-empty">Unassigned</span>';
+  return people.map(p=>{
+    if(isTotersEmail(p)){
+      const profile = personProfileByEmail(p);
+      const label = emailToDisplayName(p);
+      return `<a class="ext-link person-link" href="mailto:${escAttr(p)}">${profile && profile.image ? `<img src="${escapeHtml(profile.image)}" alt="${escAttr(label)}" onerror="this.remove()">` : ''}<span>${escapeHtml(label)}</span></a>`;
+    }
+    return `<span class="d-empty">${escapeHtml(p)}</span>`;
+  }).join('<br>');
+}
+
+function parseCsvRows(text){
+  const rows = [];
+  let row = [];
+  let value = '';
+  let inQuotes = false;
+  for(let i=0;i<text.length;i++){
+    const ch = text[i];
+    if(ch === '"'){
+      if(inQuotes && text[i+1] === '"'){
+        value += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if(ch === ',' && !inQuotes){
+      row.push(value);
+      value = '';
+      continue;
+    }
+    if((ch === '\n' || ch === '\r') && !inQuotes){
+      if(ch === '\r' && text[i+1] === '\n') i++;
+      row.push(value);
+      rows.push(row);
+      row = [];
+      value = '';
+      continue;
+    }
+    value += ch;
+  }
+  if(value.length || row.length){
+    row.push(value);
+    rows.push(row);
+  }
+  return rows;
+}
+function normalizeCol(s){
+  return String(s||'').replace(/\uFEFF/g,'').trim().toLowerCase().replace(/\s+/g,' ');
+}
+function appMatchKey(name){
+  return normalizeCol(name)
+    .replace(/[^a-z0-9\s]/g,' ')
+    .replace(/\b(application|app)\b/g,' ')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+function normalizeMissingAppName(value){
+  const raw = String(value||'').trim();
+  if(!raw) return '--';
+  const normalized = normalizeCol(raw).replace(/[()]/g,'');
+  if(normalized==='missing application' || normalized==='missing app' || normalized==='--') return '--';
+  return raw;
+}
+function resolveKnownAppName(rawName){
+  const raw = normalizeMissingAppName(rawName);
+  if(raw==='--') return '--';
+  if(!raw) return '';
+  const exact = DATA.apps.find(a=>normalizeCol(a.name)===normalizeCol(raw));
+  if(exact) return exact.name;
+  const key = appMatchKey(raw);
+  if(!key) return raw;
+  const candidates = DATA.apps
+    .map(a=>({name:a.name, key:appMatchKey(a.name)}))
+    .filter(c=>c.key);
+  const strict = candidates.find(c=>c.key===key);
+  if(strict) return strict.name;
+  const loose = candidates.find(c=>c.key.includes(key) || key.includes(c.key));
+  return loose ? loose.name : raw;
+}
+function findHeaderIndex(headers, aliases){
+  const normalizedAliases = aliases.map(normalizeCol);
+  for(let i=0;i<headers.length;i++){
+    const h = normalizeCol(headers[i]);
+    if(!h) continue;
+    if(normalizedAliases.includes(h)) return i;
+  }
+  for(let i=0;i<headers.length;i++){
+    const h = normalizeCol(headers[i]);
+    if(!h || h.length < 3) continue;
+    if(normalizedAliases.some(a=>a.length >= 3 && (h.includes(a) || a.includes(h)))) return i;
+  }
+  return -1;
+}
+function extractSheetTable(rows){
+  if(!Array.isArray(rows) || !rows.length) return {headers:[], dataRows:[]};
+  let headerRowIdx = -1;
+  for(let i=0;i<rows.length;i++){
+    const h = (rows[i]||[]).map(normalizeCol).filter(Boolean);
+    const hasTitle = h.includes('request title') || h.includes('task name');
+    const hasApp = h.includes('application') || h.includes('app name');
+    if(hasTitle && hasApp){
+      headerRowIdx = i;
+      break;
+    }
+  }
+  if(headerRowIdx<0){
+    return {headers:(rows[0]||[]).map(normalizeCol), dataRows:rows.slice(1)};
+  }
+  return {
+    headers: (rows[headerRowIdx]||[]).map(normalizeCol),
+    dataRows: rows.slice(headerRowIdx+1)
+  };
+}
+function buildSheetSignature(table){
+  const headersPart = (table.headers||[]).join('\u241f');
+  const rowsPart = (table.dataRows||[]).map(r=>(r||[]).map(c=>String(c||'').trim()).join('\u241f')).join('\u241e');
+  return headersPart + '\u241d' + rowsPart;
+}
+function looksLikeHtml(text){
+  const lower = String(text||'').slice(0, 3000).toLowerCase();
+  return lower.includes('<!doctype html') || lower.includes('<html') || lower.includes('servicelogin') || lower.includes('accounts.google.com');
+}
+function publishedCsvCandidates(url){
+  if(!url) return [];
+  const out = [];
+  try{
+    const u = new URL(url);
+    const href = u.toString();
+    if(href.includes('/pubhtml')){
+      const base = href.replace('/pubhtml', '/pub');
+      const withCsv = base + (base.includes('?') ? '&' : '?') + 'output=csv';
+      out.push(withCsv);
+      if(u.searchParams.get('gid')){
+        out.push(`${u.origin}${u.pathname.replace('/pubhtml','/pub')}?gid=${encodeURIComponent(u.searchParams.get('gid'))}&single=true&output=csv`);
+      }
+    } else if(href.includes('/pub')){
+      out.push(href.includes('output=csv') ? href : href + (href.includes('?') ? '&' : '?') + 'output=csv');
+    } else {
+      out.push(href);
+    }
+  }catch(e){
+    // ignore malformed published URL
+  }
+  return [...new Set(out)];
+}
+function publishedJsonpCandidates(url){
+  if(!url) return [];
+  try{
+    const u = new URL(url);
+    const gid = u.searchParams.get('gid') || '0';
+    if(u.pathname.includes('/d/e/')){
+      const base = `${u.origin}${u.pathname.replace('/pubhtml','').replace('/pub','')}`;
+      return [
+        `${base}/gviz/tq?gid=${encodeURIComponent(gid)}`,
+        `${base}/gviz/tq?gid=0`
+      ];
+    }
+  }catch(e){
+    // ignore malformed URL
+  }
+  return [];
+}
+function sheetTaskKey(title, appName){
+  return `${String(title||'').trim().toLowerCase()}::${String(appName||'').trim().toLowerCase()}`;
+}
+function parseGvizRows(payload){
+  const table = payload && payload.table;
+  if(!table || !Array.isArray(table.cols) || !Array.isArray(table.rows)) throw new Error('SHEET_PARSE_FAILED');
+  const headers = table.cols.map(c=>String((c && (c.label || c.id)) || '').trim());
+  const rows = [headers];
+  table.rows.forEach(r=>{
+    const cells = (r && r.c) || [];
+    rows.push(cells.map(cell=>{
+      if(!cell) return '';
+      const val = cell.f!=null ? cell.f : cell.v;
+      return val==null ? '' : String(val).trim();
+    }));
+  });
+  return rows;
+}
+function fetchSheetRowsViaJsonp(){
+  return new Promise((resolve, reject)=>{
+    const cb = '__pdSheetSyncCb' + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+    const script = document.createElement('script');
+    let done = false;
+    const cleanup = ()=>{
+      if(script.parentNode) script.parentNode.removeChild(script);
+      try{ delete window[cb]; }catch(e){ window[cb] = undefined; }
+    };
+    const timeout = setTimeout(()=>{
+      if(done) return;
+      done = true;
+      cleanup();
+      reject(new Error('SHEET_AUTH_REQUIRED'));
+    }, 12000);
+    window[cb] = function(payload){
+      if(done) return;
+      done = true;
+      clearTimeout(timeout);
+      cleanup();
+      try{
+        resolve(parseGvizRows(payload));
+      }catch(err){
+        reject(err);
+      }
+    };
+    script.onerror = ()=>{
+      if(done) return;
+      done = true;
+      clearTimeout(timeout);
+      cleanup();
+      reject(new Error('SHEET_FETCH_FAILED'));
+    };
+    script.src = `${PD_SHEET_GVIZ_JSONP_URL};responseHandler:${cb}`;
+    document.head.appendChild(script);
+  });
+}
+function fetchSheetRowsViaJsonpFromUrl(baseUrl){
+  return new Promise((resolve, reject)=>{
+    const cb = '__pdSheetPubCb' + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+    const script = document.createElement('script');
+    let done = false;
+    const cleanup = ()=>{
+      if(script.parentNode) script.parentNode.removeChild(script);
+      try{ delete window[cb]; }catch(e){ window[cb] = undefined; }
+    };
+    const timeout = setTimeout(()=>{
+      if(done) return;
+      done = true;
+      cleanup();
+      reject(new Error('SHEET_AUTH_REQUIRED'));
+    }, 12000);
+    window[cb] = function(payload){
+      if(done) return;
+      done = true;
+      clearTimeout(timeout);
+      cleanup();
+      try{
+        resolve(parseGvizRows(payload));
+      }catch(err){
+        reject(err);
+      }
+    };
+    script.onerror = ()=>{
+      if(done) return;
+      done = true;
+      clearTimeout(timeout);
+      cleanup();
+      reject(new Error('SHEET_FETCH_FAILED'));
+    };
+    script.src = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}tqx=responseHandler:${cb}`;
+    document.head.appendChild(script);
+  });
+}
+async function fetchSheetRows(){
+  let authBlocked = false;
+  let lastError = null;
+  let localHadAny = false;
+  let localHadNotFound = false;
+  let localHadFetchError = false;
+  for(const localUrl of PD_LOCAL_CSV_URLS){
+    try{
+      localHadAny = true;
+      const res = await fetch(localUrl, {cache:'no-store'});
+      if(!res.ok){
+        if(res.status===404) localHadNotFound = true;
+        continue;
+      }
+      const text = await res.text();
+      const rows = parseCsvRows(text);
+      if(rows.length) return rows;
+    }catch(err){
+      localHadFetchError = true;
+      lastError = err;
+    }
+  }
+  if(window.location.protocol === 'file:' && localHadAny && localHadFetchError){
+    throw new Error('LOCAL_FILE_FETCH_BLOCKED');
+  }
+  const allRemoteCsvUrls = PD_SHEET_CSV_URLS.concat(publishedCsvCandidates(PD_SHEET_PUBLISHED_URL));
+  for(const url of allRemoteCsvUrls){
+    try{
+      const res = await fetch(url, {cache:'no-store'});
+      if(!res.ok){
+        lastError = new Error('Sheet fetch failed with status '+res.status);
+        continue;
+      }
+      const text = await res.text();
+      if(looksLikeHtml(text)){
+        authBlocked = true;
+        continue;
+      }
+      const rows = parseCsvRows(text);
+      if(rows.length) return rows;
+    }catch(err){
+      lastError = err;
+    }
+  }
+  for(const gvizUrl of publishedJsonpCandidates(PD_SHEET_PUBLISHED_URL)){
+    try{
+      return await fetchSheetRowsViaJsonpFromUrl(gvizUrl);
+    }catch(err){
+      lastError = err;
+    }
+  }
+  try{
+    return await fetchSheetRowsViaJsonp();
+  }catch(err){
+    if(localHadNotFound){
+      throw new Error('LOCAL_FILE_NOT_FOUND');
+    }
+    if(String(err && err.message)==='SHEET_AUTH_REQUIRED' || authBlocked){
+      throw new Error('SHEET_AUTH_REQUIRED');
+    }
+    throw lastError || err || new Error('SHEET_FETCH_FAILED');
+  }
+}
+function reportSheetSyncError(msg){
+  const now = Date.now();
+  pdSheetLastStatus = 'err';
+  pdSheetLastStatusText = msg;
+  renderSheetSyncBadge();
+  // avoid toast spam while polling
+  if(msg!==pdSheetLastErrorMsg || (now - pdSheetLastErrorAt) > 10*60*1000){
+    showToast(msg);
+    pdSheetLastErrorAt = now;
+    pdSheetLastErrorMsg = msg;
+  }
+}
+async function fetchSheetRowsFromBackend(){
+  try{
+    const res = await fetch(`${PD_SHEET_BACKEND_URL}/api/pd-sheet/tasks`, {cache:'no-store'});
+    if(!res.ok){
+      pdBackendState = 'disconnected';
+      renderBackendIndicator();
+      return null;
+    }
+    const data = await res.json();
+    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    mergeTotersPeopleDirectory(Array.isArray(data.peopleDirectory) ? data.peopleDirectory : []);
+    pdBackendState = 'connected';
+    renderBackendIndicator();
+    return tasks.map(t=>({
+      sheetKey: (t.sheetKey||'').trim(),
+      title: (t.title||'').trim(),
+      appName: (t.appName||'').trim(),
+      productDesigner: normalizePeopleCsv((t.productDesigner||t.assignee||'').trim()),
+      productManager: normalizePeopleCsv((t.productManager||t.pm||'').trim()),
+      engineers: normalizePeopleCsv((t.engineers||'').trim()),
+      startDate: toIsoDate(t.startDate || ''),
+      estDate: toIsoDate(t.estDate || ''),
+      missingRequiredFields: Array.isArray(t.missingRequiredFields) ? t.missingRequiredFields : missingRequiredFieldsForSheetTask({
+        title: (t.title||'').trim(),
+        appName: (t.appName||'').trim(),
+        productDesigner: (t.productDesigner||t.assignee||'').trim(),
+        productManager: (t.productManager||t.pm||'').trim(),
+        startDate: toIsoDate(t.startDate || ''),
+        estDate: toIsoDate(t.estDate || '')
+      })
+    })).filter(t=>t.title && t.appName);
+  }catch(e){
+    pdBackendState = 'disconnected';
+    renderBackendIndicator();
+    return null;
+  }
+}
+function upsertSheetTasksFromMappedRows(mappedRows){
+  const customTasks = pdBoardState.tasksCustom || (pdBoardState.tasksCustom = []);
+  const deletedSheetKeys = new Set(pdBoardState.deletedSheetKeys || []);
+  const deletedSheetStableKeys = new Set(pdBoardState.deletedSheetStableKeys || []);
+  const existingSheetTasks = customTasks.filter(t=>t.source==='sheet');
+  const sheetByKey = new Map();
+  const sheetByTitle = new Map();
+  existingSheetTasks.forEach(t=>{
+    if(t.sheetKey) sheetByKey.set(t.sheetKey, t);
+    const titleKey = normalizeCol(t.title || '');
+    if(titleKey && !sheetByTitle.has(titleKey)) sheetByTitle.set(titleKey, t);
+  });
+
+  let added = 0, updated = 0, removed = 0;
+  const seenSheetTaskIds = new Set();
+  const seenSheetKeys = new Set();
+  mappedRows.forEach(item=>{
+    const title = item.title;
+    const appName = resolveKnownAppName(item.appName);
+    const productDesigner = item.productDesigner || '';
+    const productManager = item.productManager || '';
+    const engineers = item.engineers || '';
+    const startDate = item.startDate || '';
+    const estDate = item.estDate || '';
+    const missingRequiredFields = Array.isArray(item.missingRequiredFields) ? item.missingRequiredFields : missingRequiredFieldsForSheetTask({title, appName, productDesigner, productManager, startDate, estDate});
+    const key = item.sheetKey || sheetTaskKey(title, appName);
+    const stableKey = sheetTaskKey(title, appName);
+    if(deletedSheetKeys.has(key) || deletedSheetStableKeys.has(stableKey)) return;
+    seenSheetKeys.add(key);
+
+    let existing = sheetByKey.get(key);
+    if(!existing){
+      const byTitle = sheetByTitle.get(normalizeCol(title));
+      if(byTitle && !seenSheetTaskIds.has(byTitle.id)){
+        existing = byTitle;
+        existing.sheetKey = key;
+        sheetByKey.set(key, existing);
+      }
+    }
+    if(!existing){
+      const id = uid('pd-sheet');
+      existing = {
+        id,
+        title,
+        appName,
+        featureName:'',
+        pages:[],
+        productDesigner,
+        productManager,
+        engineers,
+        assignee: productDesigner || 'Unassigned',
+        startDate,
+        estDate,
+        files:[],
+        productArea:'',
+        custom:true,
+        source:'sheet',
+        sheetKey:key,
+        sheetStableKey: stableKey,
+        missingRequiredFields
+      };
+      customTasks.push(existing);
+      sheetByKey.set(key, existing);
+      sheetByTitle.set(normalizeCol(title), existing);
+      if(!pdBoardState.states[id]){
+        pdBoardState.states[id] = {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString()), applicableStatuses:null};
+      }
+      added++;
+    } else {
+      const changed = existing.title!==title || existing.appName!==appName || (existing.productDesigner||existing.assignee||'')!==productDesigner || (existing.productManager||'')!==productManager || (existing.engineers||'')!==engineers || (existing.startDate||'')!==startDate || (existing.estDate||'')!==estDate || existing.sheetKey!==key || JSON.stringify(existing.missingRequiredFields||[])!==JSON.stringify(missingRequiredFields);
+      if(changed){
+        existing.title = title;
+        existing.appName = appName;
+        existing.productDesigner = productDesigner;
+        existing.productManager = productManager;
+        existing.engineers = engineers;
+        existing.assignee = productDesigner || 'Unassigned';
+        existing.startDate = startDate;
+        existing.estDate = estDate;
+        existing.sheetKey = key;
+        existing.sheetStableKey = stableKey;
+        existing.missingRequiredFields = missingRequiredFields;
+        updated++;
+      }
+    }
+    seenSheetTaskIds.add(existing.id);
+  });
+
+  // Do not delete board tasks when sheet rows are removed.
+  removed = 0;
+  return {added, updated, removed};
+}
+async function syncPdTasksFromSheet(options){
+  if(pdSheetSyncRunning) return;
+  pdSheetSyncRunning = true;
+  const showToastOnAdd = !!(options && options.showToastOnAdd);
+  const force = !!(options && options.force);
+  try{
+    const backendRows = await fetchSheetRowsFromBackend();
+    if(backendRows){
+      const backendSignature = buildSheetSignature(
+        ['sheetKey','request title','application','product designer','product manager','expected start time','expected deadline'],
+        backendRows.map(r=>[r.sheetKey||'', r.title, r.appName, r.productDesigner||r.assignee, r.productManager||'', r.startDate, r.estDate])
+      );
+      const result = upsertSheetTasksFromMappedRows(backendRows);
+      if(result.added || result.updated || result.removed){
+        await storageSet('pd-board-state', pdBoardState);
+        renderAll();
+        pdSheetLastErrorMsg = '';
+        if(showToastOnAdd){
+          if(result.added){
+            showToast(`${result.added} new task${result.added===1?'':'s'} added from sheet`);
+          } else if(result.updated || result.removed){
+            showToast(`Sheet sync updated ${result.updated} task${result.updated===1?'':'s'}${result.removed?` and removed ${result.removed}`:''}.`);
+          }
+        }
+      }
+      pdSheetLastSyncedAt = Date.now();
+      pdSheetLastStatus = 'ok';
+      pdSheetLastStatusText = (result.added || result.updated || result.removed)
+        ? `Sheet sync (backend): ${result.added} added, ${result.updated} updated${result.removed ? `, ${result.removed} removed` : ''} (${new Date(pdSheetLastSyncedAt).toLocaleTimeString()})`
+        : `Sheet sync (backend): up to date (${new Date(pdSheetLastSyncedAt).toLocaleTimeString()})`;
+      renderSheetSyncBadge();
+      pdSheetLastSignature = backendSignature;
+      return;
+    }
+    const rows = await fetchSheetRows();
+    if(!rows.length) return;
+    const table = extractSheetTable(rows);
+    const nextSignature = buildSheetSignature(table);
+    if(!force && pdSheetLastSignature && nextSignature===pdSheetLastSignature){
+      pdSheetLastStatus = 'ok';
+      pdSheetLastStatusText = `Sheet sync: up to date (${new Date().toLocaleTimeString()})`;
+      renderSheetSyncBadge();
+      return;
+    }
+    const headers = table.headers;
+    const idxTitle = findHeaderIndex(headers, ['Request Title', 'Task Name', 'Title']);
+    const idxApp = findHeaderIndex(headers, ['Application', 'App Name', 'App']);
+    const idxPm = findHeaderIndex(headers, ['Product Manager', 'PM', 'PM Name', 'Product Manager Email']);
+    const idxStart = findHeaderIndex(headers, ['Expected Start Time', 'Expected Start Date', 'Start Date']);
+    const idxDeadline = findHeaderIndex(headers, ['Expected Deadline', 'Expected Due Date', 'Deadline', 'Due Date']);
+    const idxPd = findHeaderIndex(headers, ['Product Designer', 'Designer', 'PD']);
+    if(idxTitle<0 || idxApp<0){
+      reportSheetSyncError(`Sheet sync: required columns missing. Found headers: ${headers.filter(Boolean).slice(0,6).join(', ') || 'none'}`);
+      console.warn('PD sheet sync skipped: required columns not found');
+      return;
+    }
+
+    const mappedRows = [];
+    table.dataRows.forEach(cols=>{
+      const titleRaw = (cols[idxTitle]||'').trim();
+      const appNameRaw = (cols[idxApp]||'').trim();
+      if(!titleRaw && !appNameRaw) return;
+      const title = titleRaw || '(Missing Request Title)';
+      const appName = appNameRaw || '--';
+      const productDesignerRaw = ((idxPd>=0 ? cols[idxPd] : '') || '').trim();
+      const productManagerRaw = ((idxPm>=0 ? cols[idxPm] : '') || '').trim();
+      mappedRows.push({
+        sheetKey: `row-${mappedRows.length+1}::${sheetTaskKey(title, appName)}`,
+        title,
+        appName,
+        productDesigner: productDesignerRaw,
+        productManager: productManagerRaw,
+        engineers: '',
+        missingRequiredFields: missingRequiredFieldsForSheetTask({
+          title: titleRaw,
+          appName: appNameRaw,
+          productDesigner: productDesignerRaw,
+          productManager: productManagerRaw,
+          startDate: toIsoDate(idxStart>=0 ? cols[idxStart] : ''),
+          estDate: toIsoDate(idxDeadline>=0 ? cols[idxDeadline] : '')
+        }),
+        startDate: toIsoDate(idxStart>=0 ? cols[idxStart] : ''),
+        estDate: toIsoDate(idxDeadline>=0 ? cols[idxDeadline] : '')
+      });
+    });
+    const result = upsertSheetTasksFromMappedRows(mappedRows);
+
+    if(result.added || result.updated || result.removed){
+      await storageSet('pd-board-state', pdBoardState);
+      renderAll();
+      pdSheetLastErrorMsg = '';
+      if(showToastOnAdd){
+        if(result.added){
+          showToast(`${result.added} new task${result.added===1?'':'s'} added from sheet`);
+        } else if(result.updated || result.removed){
+          showToast(`Sheet sync updated ${result.updated} task${result.updated===1?'':'s'}${result.removed?` and removed ${result.removed}`:''}.`);
+        }
+      }
+    }
+    pdSheetLastSyncedAt = Date.now();
+    pdSheetLastStatus = 'ok';
+    pdSheetLastStatusText = `Sheet sync: ${result.added} added, ${result.updated} updated${result.removed ? `, ${result.removed} removed` : ''} (${new Date(pdSheetLastSyncedAt).toLocaleTimeString()})`;
+    renderSheetSyncBadge();
+    pdSheetLastSignature = nextSignature;
+  }catch(err){
+    const msg = String(err && err.message || '');
+    if(msg==='SHEET_AUTH_REQUIRED'){
+      reportSheetSyncError('Sheet sync blocked. Use published CSV or place pd-sheet.csv next to this portal, then refresh.');
+    } else if(msg==='LOCAL_FILE_FETCH_BLOCKED'){
+      reportSheetSyncError('Local CSV blocked in file mode. Run a local server and open http://localhost:8080/dashboard.html');
+    } else if(msg==='LOCAL_FILE_NOT_FOUND'){
+      reportSheetSyncError('pd-sheet.csv not found in project folder.');
+    } else {
+      reportSheetSyncError('Sheet sync failed. Add pd-sheet.csv in this folder and refresh.');
+    }
+    console.warn('PD sheet sync failed', err);
+  }finally{
+    pdSheetSyncRunning = false;
+  }
+}
+function startPdSheetSyncLoop(){
+  if(pdSheetSyncTimer) clearInterval(pdSheetSyncTimer);
+  pdSheetSyncTimer = setInterval(()=>{ syncPdTasksFromSheet(); }, PD_SHEET_POLL_MS);
+}
+function stopPdSheetSyncLoop(){
+  if(!pdSheetSyncTimer) return;
+  clearInterval(pdSheetSyncTimer);
+  pdSheetSyncTimer = null;
+}
+
+window.addEventListener('focus', ()=>{ syncPdTasksFromSheet({force:true}); });
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible'){
+    syncPdTasksFromSheet({force:true});
+  }
+});
 
 // window.storage only exists inside Claude.ai's artifact preview. Opened as a
 // plain downloaded/hosted file (which is how this portal is normally used),
@@ -248,6 +1150,7 @@ async function loadBoards(){
         uxrChanged = true;
     }
   });
+  if(auditSheetTaskRequiredFieldsInState()) pdChanged = true;
   if(pdChanged) await storageSet('pd-board-state', pdBoardState);
   if(uxrChanged) await storageSet('uxr-board-state', uxrBoardState);
 }
@@ -257,8 +1160,13 @@ async function loadBoards(){
    ============================================================ */
 function getAllPdTasks(){
   const base = DATA.pdTasks.map(t=>({
-    id: t.id || t.name, title: t.name, appName: (t.apps&&t.apps[0])||'', featureName: t.feature||'',
-    pages: t.pages||[], assignee: (t.pd&&t.pd.join(', '))||'Unassigned', estDate: t.estDate||'',
+    id: t.id || t.name, title: t.name, appName: normalizeMissingAppName((t.apps&&t.apps[0])||''), featureName: t.feature||'',
+    pages: t.pages||[],
+    productDesigner: t.productDesigner || (t.pd&&t.pd.join(', ')) || '',
+    productManager: t.productManager || '',
+    engineers: t.engineers || '',
+    assignee: t.productDesigner || (t.pd&&t.pd.join(', ')) || 'Unassigned',
+    startDate: t.startDate||'', estDate: t.estDate||'',
     files: t.files||[], productArea: t.productArea||'', custom:false
   }));
   const customs = pdBoardState.tasksCustom || [];
@@ -266,6 +1174,7 @@ function getAllPdTasks(){
   return all.map(t=>{
     const st = pdBoardState.states[t.id] || {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString())};
     return Object.assign({}, t, {
+      appName: normalizeMissingAppName(t.appName),
       status: st.status,
       history: st.history,
       applicableStatuses: st.applicableStatuses || null,
@@ -278,7 +1187,10 @@ function getAllUxrTasks(){
     id: t.id || t.name,
     title: t.name,
     parentPdTask: t.parentPdTaskId || t.parentPdTask || '',
-    assignee: t.assignee || 'Unassigned',
+    productDesigner: t.productDesigner || t.assignee || '',
+    productManager: t.productManager || '',
+    engineers: t.engineers || '',
+    assignee: t.productDesigner || t.assignee || 'Unassigned',
     estDate: t.estDate || '',
     custom:false
   }));
@@ -326,6 +1238,14 @@ async function moveTask(board, id, newStatus){
   const key = board==='pd' ? 'pd-board-state' : 'uxr-board-state';
   const st = store.states[id];
   if(!st || st.status===newStatus) return;
+  if(board==='pd'){
+    const task = getAllPdTasks().find(x=>x.id===id);
+    const missing = task && Array.isArray(task.missingRequiredFields) ? task.missingRequiredFields : [];
+    if(task && task.source==='sheet' && missing.length){
+      showToast(`Complete required fields first: ${missing.join(', ')}`);
+      return;
+    }
+  }
   const allowed = normalizeAllowedStatuses(board, st.applicableStatuses || null);
   if(!allowed.includes(newStatus)){
     showToast('This task doesn\u2019t use the "'+newStatus+'" status');
@@ -339,17 +1259,39 @@ async function moveTask(board, id, newStatus){
 
 async function addPdTask(data){
   const id = uid('pd-custom');
+  const productDesigner = data.productDesigner || data.assignee || '';
   pdBoardState.tasksCustom.push({id, title:data.title, appName:data.appName, featureName:data.featureName,
-    pages:[], assignee:data.assignee||'Unassigned', estDate:data.estDate||'', files:[], productArea:'', custom:true});
-  pdBoardState.states[id] = {status:data.status||'Not Started', history:seedHistory(data.status||'Not Started', new Date().toISOString()), applicableStatuses:data.applicableStatuses||null};
+    pages:[],
+    productDesigner,
+    productManager:data.productManager||'',
+    engineers:data.engineers||'',
+    assignee:productDesigner||'Unassigned',
+    startDate:data.startDate||'',
+    estDate:data.estDate||'',
+    files:[],
+    productArea:'',
+    custom:true
+  });
+  pdBoardState.states[id] = {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString()), applicableStatuses:data.applicableStatuses||null};
   await storageSet('pd-board-state', pdBoardState);
   renderAll();
   showToast('Task added to PD board');
 }
 async function addUxrTask(data){
   const id = uid('uxr-custom');
-  uxrBoardState.tasksCustom.push({id, title:data.title, parentPdTask:data.parentPdTask||'', assignee:data.assignee||'Unassigned', estDate:data.estDate||'', custom:true});
-  uxrBoardState.states[id] = {status:data.status||'Not Started', history:seedHistory(data.status||'Not Started', new Date().toISOString()), applicableStatuses:data.applicableStatuses||null};
+  const productDesigner = data.productDesigner || data.assignee || '';
+  uxrBoardState.tasksCustom.push({
+    id,
+    title:data.title,
+    parentPdTask:data.parentPdTask||'',
+    productDesigner,
+    productManager:data.productManager||'',
+    engineers:data.engineers||'',
+    assignee:productDesigner||'Unassigned',
+    estDate:data.estDate||'',
+    custom:true
+  });
+  uxrBoardState.states[id] = {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString()), applicableStatuses:data.applicableStatuses||null};
   await storageSet('uxr-board-state', uxrBoardState);
   renderAll();
   showToast('Task added to UXR board');
@@ -660,7 +1602,7 @@ function computeWorkload(pd, uxr){
   function addTasks(tasks){
     tasks.forEach(t=>{
       if(t.status==='Done') return;
-      const names = (t.assignee||'Unassigned').split(',').map(s=>s.trim()).filter(Boolean);
+      const names = splitPeople(t.productDesigner||t.assignee);
       (names.length?names:['Unassigned']).forEach(n=>{
         byPerson[n] = byPerson[n] || {total:0, statusCounts:{}};
         byPerson[n].total++;
@@ -679,7 +1621,7 @@ function computeWorkloadByStatus(pd, uxr){
       const key = board+'·'+t.status;
       byStatus[key] = byStatus[key] || {total:0, board, statusId:t.status, personCounts:{}};
       byStatus[key].total++;
-      const names = (t.assignee||'Unassigned').split(',').map(s=>s.trim()).filter(Boolean);
+      const names = splitPeople(t.productDesigner||t.assignee);
       (names.length?names:['Unassigned']).forEach(n=>{ byStatus[key].personCounts[n] = (byStatus[key].personCounts[n]||0)+1; });
     });
   }
@@ -1359,8 +2301,9 @@ function getTaskUxrAssignees(taskName){
   const names = new Set();
   const related = allUxr.filter(x=>x.parentPdTask===pdTask.id || x.parentPdTask===pdTask.name || (pdTask.uxrTasks||[]).includes(x.title));
   related.forEach(t=>{
-    if(t && t.assignee){
-      t.assignee.split(',').map(s=>s.trim()).filter(Boolean).forEach(n=>names.add(n));
+    const owners = splitPeople(t.productDesigner||t.assignee);
+    if(owners.length){
+      owners.forEach(n=>names.add(n));
     }
   });
   return [...names];
@@ -1653,11 +2596,11 @@ function renderMapFilterPanel(){
   document.getElementById('mfStatuses').innerHTML = PD_STATUSES.map(s=>chipHtml('statuses', s.id)).join('');
 
   const pdNames = new Set();
-  DATA.pdTasks.forEach(t=>(t.pd||[]).forEach(n=>pdNames.add(n)));
+  getAllPdTasks().forEach(t=>splitPeople(t.productDesigner||t.assignee).forEach(n=>pdNames.add(n)));
   document.getElementById('mfPd').innerHTML = [...pdNames].sort().map(n=>chipHtml('pd', n)).join('');
 
   const uxrNames = new Set();
-  getAllUxrTasks().forEach(t=>(t.assignee||'').split(',').map(s=>s.trim()).filter(Boolean).forEach(n=>uxrNames.add(n)));
+  getAllUxrTasks().forEach(t=>splitPeople(t.productDesigner||t.assignee).forEach(n=>uxrNames.add(n)));
   document.getElementById('mfUxr').innerHTML = [...uxrNames].sort().map(n=>chipHtml('uxr', n)).join('');
 
   updateFilterCount();
@@ -1758,14 +2701,26 @@ function populateBoardFilters(){
   appSel.innerHTML = `<option value="">All apps</option>` + appNames.map(n=>`<option value="${escAttr(n)}">${escapeHtml(n)}</option>`).join('');
   appSel.value = boardFilters.app;
 
-  const pdNames = new Set();
-  getAllPdTasks().forEach(t=>(t.assignee||'').split(',').map(s=>s.trim()).filter(Boolean).forEach(n=>pdNames.add(n)));
-  pdSel.innerHTML = `<option value="">All designers</option>` + [...pdNames].sort().map(n=>`<option value="${escAttr(n)}">${escapeHtml(n)}</option>`).join('');
+  const pdMap = new Map();
+  getAllPdTasks().forEach(t=>splitPeople(t.productDesigner||t.assignee).forEach(n=>{
+    const key = peopleFilterKey(n);
+    if(!key || pdMap.has(key)) return;
+    pdMap.set(key, emailToDisplayName(n));
+  }));
+  pdSel.innerHTML = `<option value="">All designers</option>` + [...pdMap.entries()]
+    .sort((a,b)=>a[1].localeCompare(b[1]))
+    .map(([key,label])=>`<option value="${escAttr(key)}">${escapeHtml(label)}</option>`).join('');
   pdSel.value = boardFilters.pd;
 
-  const uxrNames = new Set();
-  getAllUxrTasks().forEach(t=>(t.assignee||'').split(',').map(s=>s.trim()).filter(Boolean).forEach(n=>uxrNames.add(n)));
-  uxrSel.innerHTML = `<option value="">All researchers</option>` + [...uxrNames].sort().map(n=>`<option value="${escAttr(n)}">${escapeHtml(n)}</option>`).join('');
+  const uxrMap = new Map();
+  getAllUxrTasks().forEach(t=>splitPeople(t.productDesigner||t.assignee).forEach(n=>{
+    const key = peopleFilterKey(n);
+    if(!key || uxrMap.has(key)) return;
+    uxrMap.set(key, emailToDisplayName(n));
+  }));
+  uxrSel.innerHTML = `<option value="">All researchers</option>` + [...uxrMap.entries()]
+    .sort((a,b)=>a[1].localeCompare(b[1]))
+    .map(([key,label])=>`<option value="${escAttr(key)}">${escapeHtml(label)}</option>`).join('');
   uxrSel.value = boardFilters.uxr;
 }
 
@@ -1773,6 +2728,8 @@ function renderBoardsPage(){
   populateBoardFilters();
 
   document.getElementById('boardSubtitle').textContent = BOARD_COPY[activeBoard].sub;
+  renderSheetSyncBadge();
+  renderBackendIndicator();
   document.querySelectorAll('#boardSubtabs .subtab-btn').forEach(b=>b.classList.toggle('active', b.dataset.board===activeBoard));
   document.getElementById('filterPdWrap').classList.toggle('disabled', activeBoard!=='pd');
   document.getElementById('filterUxrWrap').classList.toggle('disabled', activeBoard!=='uxr');
@@ -1811,11 +2768,11 @@ function applyBoardFilters(board, tasks){
       if(appName !== boardFilters.app) return false;
     }
     if(board==='pd' && boardFilters.pd){
-      const names = (t.assignee||'').split(',').map(s=>s.trim());
+      const names = splitPeople(t.productDesigner||t.assignee).map(peopleFilterKey);
       if(!names.includes(boardFilters.pd)) return false;
     }
     if(board==='uxr' && boardFilters.uxr){
-      const names = (t.assignee||'').split(',').map(s=>s.trim());
+      const names = splitPeople(t.productDesigner||t.assignee).map(peopleFilterKey);
       if(!names.includes(boardFilters.uxr)) return false;
     }
     return true;
@@ -1889,13 +2846,28 @@ function cardHtml(board, t){
   const overdue = isOverdue(t.estDate, t.status);
   const fullStatuses = (board==='pd' ? PD_STATUSES : UXR_STATUSES).map(s=>s.id);
   const allowed = t.allowedStatuses || normalizeAllowedStatuses(board, t.applicableStatuses || null);
+  const statusDefs = (board==='pd' ? PD_STATUSES : UXR_STATUSES).filter(s=>
+    allowed.includes(s.id) && s.id!=='Not Started' && s.id!=='Done'
+  );
+  const statusTrackTitle = statusDefs.length
+    ? `Statuses: ${statusDefs.map(s=>s.id).join(' → ')}`
+    : 'Statuses: none';
+  const statusTrack = `<div class="kc-status-track" title="${escAttr(statusTrackTitle)}">${statusDefs.map(s=>{
+    const v = colorVars(s.color);
+    return `<span class="kc-status-dot" style="background:${v.bg};border-color:${v.bd}" aria-label="${escAttr(s.id)}"></span>`;
+  }).join('')}</div>`;
   const statusesAttr = allowed.length===fullStatuses.length ? '' : ` data-statuses="${escAttr(allowed.join('|'))}"`;
   if(board==='pd'){
+    const missingFields = Array.isArray(t.missingRequiredFields) ? t.missingRequiredFields : [];
+    const hasSheetAlert = t.source==='sheet' && missingFields.length>0;
+    const missingTitle = hasSheetAlert ? `Missing required: ${missingFields.join(', ')}` : '';
     return `<div class="kcard" draggable="true" data-id="${escAttr(t.id)}"${statusesAttr}>
       ${t.appName?`<div class="kc-app">${escapeHtml(t.appName)}</div>`:''}
       <div class="kc-title">${escapeHtml(t.title)}</div>
+      ${hasSheetAlert ? `<div class="kc-alert-icon" title="${escAttr(missingTitle)}" aria-label="${escAttr(missingTitle)}">⚠</div>` : ''}
+      ${statusTrack}
       <div class="kc-meta">
-        <div class="kc-assignee"><div class="kc-avatar">${initials(t.assignee)}</div>${escapeHtml((t.assignee||'').split(',')[0]||'Unassigned')}</div>
+        <div class="kc-assignee">${personAvatarHtml(splitPeople(t.productDesigner||t.assignee)[0], peopleDisplayPrimary(t.productDesigner||t.assignee))}${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</div>
         <div class="kc-date ${overdue?'overdue':''}">${t.estDate?fmtDate(t.estDate):'No date'}</div>
       </div>
       ${t.featureName?`<div class="kc-link-tag"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6h11M9 12h11M9 18h11M5 6h.01M5 12h.01M5 18h.01"/></svg>${escapeHtml(t.featureName)}</div>`:''}
@@ -1904,8 +2876,9 @@ function cardHtml(board, t){
     return `<div class="kcard" draggable="true" data-id="${escAttr(t.id)}"${statusesAttr}>
       <div class="kc-app">Research</div>
       <div class="kc-title">${escapeHtml(t.title)}</div>
+      ${statusTrack}
       <div class="kc-meta">
-        <div class="kc-assignee"><div class="kc-avatar">${initials(t.assignee)}</div>${escapeHtml((t.assignee||'').split(',')[0]||'Unassigned')}</div>
+        <div class="kc-assignee">${personAvatarHtml(splitPeople(t.productDesigner||t.assignee)[0], peopleDisplayPrimary(t.productDesigner||t.assignee))}${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</div>
         <div class="kc-date ${overdue?'overdue':''}">${t.estDate?fmtDate(t.estDate):'No date'}</div>
       </div>
       ${t.parentPdTask?`<div class="kc-link-tag"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M13 7l5 5-5 5M6 7l5 5-5 5"/></svg>${escapeHtml(t.parentPdTask)}</div>`:''}
@@ -1931,13 +2904,30 @@ function openPdCardDetail(id){
   const optionalMsg = enabledOptional.length===PD_CREATION_STATUSES.length
     ? ''
     : `Optional statuses enabled: ${enabledOptional.length ? enabledOptional.map(escapeHtml).join(', ') : 'none'}`;
+  const missingFields = Array.isArray(t.missingRequiredFields) ? t.missingRequiredFields : [];
+  const statusesThisTaskUses = (t.allowedStatuses || normalizeAllowedStatuses('pd', t.applicableStatuses || null));
   openDrawer(`
     <div class="d-type">PD Task${t.custom?' · custom':''}</div>
     <h2>${escapeHtml(t.title)}</h2>
+    <div class="d-empty" style="margin-top:4px">${PD_REQUIRED_FIELD_HINT}</div>
     <div class="t-meta">
       ${t.appName?`<span class="tag acc">${escapeHtml(t.appName)}</span>`:''}
-      ${t.assignee?`<span class="tag">${escapeHtml(t.assignee)}</span>`:''}
+      <span class="tag">Product Designer: ${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</span>
+      ${t.startDate?`<span class="tag">Start ${fmtDate(t.startDate)}</span>`:''}
       ${t.estDate?`<span class="tag ${isOverdue(t.estDate,t.status)?'':''}" style="${isOverdue(t.estDate,t.status)?'background:var(--danger-soft);color:#A8332A':''}">Due ${fmtDate(t.estDate)}</span>`:''}
+    </div>
+    ${t.source==='sheet' && missingFields.length ? `<div class="d-section"><h5>Required fields missing in source sheet</h5><div class="d-empty">${escapeHtml(missingFields.join(', '))}</div></div>` : ''}
+    <div class="d-section"><h5>Statuses this task uses</h5>
+      <div class="status-checks">
+        ${statusesThisTaskUses.map(st=>`<label class="status-check"><input type="checkbox" checked disabled> ${escapeHtml(st)}</label>`).join('')}
+      </div>
+    </div>
+    <div class="d-section"><h5>People</h5>
+      <div class="d-list">
+        <div class="d-link-item" style="cursor:default"><span>Product Designer</span><span>${peopleListHtml(t.productDesigner||t.assignee)}</span></div>
+        <div class="d-link-item" style="cursor:default"><span>Product Manager</span><span>${peopleListHtml(t.productManager)}</span></div>
+        <div class="d-link-item" style="cursor:default"><span>Engineers</span><span>${peopleListHtml(t.engineers)}</span></div>
+      </div>
     </div>
     <div class="d-section"><h5>Status</h5>
       <div class="status-select-row">
@@ -1963,12 +2953,25 @@ function openUxrCardDetail(id){
   const t = getAllUxrTasks().find(x=>x.id===id); if(!t) return;
   const parent = getAllPdTasks().find(x=>x.id===t.parentPdTask || x.title===t.parentPdTask);
   const parentLabel = parent ? parent.title : t.parentPdTask;
+  const statusesThisTaskUses = (t.allowedStatuses || normalizeAllowedStatuses('uxr', t.applicableStatuses || null));
   openDrawer(`
     <div class="d-type">UXR Task${t.custom?' · custom':''}</div>
     <h2>${escapeHtml(t.title)}</h2>
     <div class="t-meta">
-      ${t.assignee?`<span class="tag">${escapeHtml(t.assignee)}</span>`:''}
+      <span class="tag">Product Designer: ${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</span>
       ${t.estDate?`<span class="tag">Due ${fmtDate(t.estDate)}</span>`:''}
+    </div>
+    <div class="d-section"><h5>Statuses this task uses</h5>
+      <div class="status-checks">
+        ${statusesThisTaskUses.map(st=>`<label class="status-check"><input type="checkbox" checked disabled> ${escapeHtml(st)}</label>`).join('')}
+      </div>
+    </div>
+    <div class="d-section"><h5>People</h5>
+      <div class="d-list">
+        <div class="d-link-item" style="cursor:default"><span>Product Designer</span><span>${peopleListHtml(t.productDesigner||t.assignee)}</span></div>
+        <div class="d-link-item" style="cursor:default"><span>Product Manager</span><span>${peopleListHtml(t.productManager)}</span></div>
+        <div class="d-link-item" style="cursor:default"><span>Engineers</span><span>${peopleListHtml(t.engineers)}</span></div>
+      </div>
     </div>
     <div class="d-section"><h5>Status</h5>
       <div class="status-select-row">
@@ -1996,6 +2999,15 @@ async function deleteTask(board, id){
   if(!task) return;
   if(!window.confirm(`Delete "${task.title}"? This cannot be undone.`)) return;
   if(board==='pd'){
+    if(task.source==='sheet'){
+      pdBoardState.deletedSheetKeys = Array.isArray(pdBoardState.deletedSheetKeys) ? pdBoardState.deletedSheetKeys : [];
+      pdBoardState.deletedSheetStableKeys = Array.isArray(pdBoardState.deletedSheetStableKeys) ? pdBoardState.deletedSheetStableKeys : [];
+      const full = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
+      const key = full && full.sheetKey ? full.sheetKey : '';
+      const stableKey = full && full.sheetStableKey ? full.sheetStableKey : sheetTaskKey(task.title, task.appName);
+      if(key && !pdBoardState.deletedSheetKeys.includes(key)) pdBoardState.deletedSheetKeys.push(key);
+      if(stableKey && !pdBoardState.deletedSheetStableKeys.includes(stableKey)) pdBoardState.deletedSheetStableKeys.push(stableKey);
+    }
     pdBoardState.tasksCustom = (pdBoardState.tasksCustom||[]).filter(t=>t.id!==id);
     const baseIdx = DATA.pdTasks.findIndex(t=>(t.id||t.name)===id);
     if(baseIdx>=0){
@@ -2055,12 +3067,16 @@ function editTask(board, id){
     : '';
   openModal(`
     <h3>Edit ${board.toUpperCase()} task</h3>
+    ${board==='pd' ? `<div class="d-empty" style="margin-bottom:8px">${PD_REQUIRED_FIELD_HINT}</div>` : ''}
     <div class="field"><label>Task name</label><input id="et_title" value="${escAttr(task.title)}"></div>
     ${board==='pd'
-      ? `<div class="field"><label>App</label><select id="et_app"><option value="">—</option>${apps}</select></div><div class="field"><label>Feature</label><select id="et_feature"><option value="">—</option>${feats}</select></div>`
+      ? `<div class="field"><label>App *</label><select id="et_app"><option value="">—</option>${apps}</select></div><div class="field"><label>Feature</label><select id="et_feature"><option value="">—</option>${feats}</select></div>`
       : `<div class="field"><label>Linked PD task</label><select id="et_parent"><option value="">—</option>${pdOpts}</select></div>`
     }
-    <div class="field"><label>Assignee</label><input id="et_assignee" value="${escAttr(task.assignee||'')}"></div>
+    <div class="field"><label>Product Designer${board==='pd' ? ' *' : ''}</label><input id="et_designer" value="${escAttr(task.productDesigner||task.assignee||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Product Manager${board==='pd' ? ' *' : ''}</label><input id="et_pm" value="${escAttr(task.productManager||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Engineers</label><input id="et_eng" value="${escAttr(task.engineers||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Expected start date</label><input id="et_start_date" type="date" value="${escAttr(task.startDate||'')}"></div>
     <div class="field"><label>Estimated date</label><input id="et_date" type="date" value="${escAttr(task.estDate||'')}"></div>
     <div class="field"><label>Status</label><select id="et_status">${statusOptions}</select></div>
     ${linkedSummary}
@@ -2070,6 +3086,7 @@ function editTask(board, id){
       <button class="btn primary" id="et_save">Save</button>
     </div>
   `);
+  enablePeopleFieldAutocomplete(['et_designer','et_pm','et_eng']);
   const linksToggle = document.getElementById('et_links_toggle');
   if(linksToggle){
     linksToggle.addEventListener('click', ()=>{
@@ -2087,6 +3104,17 @@ function editTask(board, id){
     const title = document.getElementById('et_title').value.trim();
     if(!title){ showToast('Task name is required'); return; }
     const status = document.getElementById('et_status').value;
+    const pdPeople = parseTotersPeople(document.getElementById('et_designer').value.trim());
+    const pmPeople = parseTotersPeople(document.getElementById('et_pm').value.trim());
+    const engPeople = parseTotersPeople(document.getElementById('et_eng').value.trim());
+    if(!pdPeople.ok || !pmPeople.ok || !engPeople.ok){
+      const invalid = [...pdPeople.invalid, ...pmPeople.invalid, ...engPeople.invalid];
+      showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
+      return;
+    }
+    const productDesigner = pdPeople.list.join(', ');
+    const productManager = pmPeople.list.join(', ');
+    const engineers = engPeople.list.join(', ');
     if(board==='pd'){
       const base = DATA.pdTasks.find(t=>(t.id||t.name)===id);
       const custom = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
@@ -2095,7 +3123,11 @@ function editTask(board, id){
         base.name = title;
         base.apps = document.getElementById('et_app').value ? [document.getElementById('et_app').value] : [];
         base.feature = document.getElementById('et_feature').value;
-        base.pd = document.getElementById('et_assignee').value.trim() ? [document.getElementById('et_assignee').value.trim()] : [];
+        base.productDesigner = productDesigner;
+        base.productManager = productManager;
+        base.engineers = engineers;
+        base.pd = productDesigner ? productDesigner.split(',').map(x=>x.trim()).filter(Boolean) : [];
+        base.startDate = document.getElementById('et_start_date').value;
         base.estDate = document.getElementById('et_date').value;
         DATA.apps.forEach(a=>replaceInArray(a.tasks, oldName, base.name));
         DATA.features.forEach(f=>replaceInArray(f.tasks, oldName, base.name));
@@ -2106,8 +3138,22 @@ function editTask(board, id){
         custom.title = title;
         custom.appName = document.getElementById('et_app').value;
         custom.featureName = document.getElementById('et_feature').value;
-        custom.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
+        custom.productDesigner = productDesigner;
+        custom.productManager = productManager;
+        custom.engineers = engineers;
+        custom.assignee = productDesigner || 'Unassigned';
+        custom.startDate = document.getElementById('et_start_date').value;
         custom.estDate = document.getElementById('et_date').value;
+        if(custom.source==='sheet'){
+          custom.missingRequiredFields = missingRequiredFieldsForSheetTask({
+            title: custom.title,
+            appName: custom.appName,
+            productDesigner,
+            productManager,
+            startDate: custom.startDate,
+            estDate: custom.estDate
+          });
+        }
       }
       syncTaskStatus(pdBoardState, id, status);
       await storageSet('pd-board-state', pdBoardState);
@@ -2117,13 +3163,19 @@ function editTask(board, id){
       if(base){
         base.name = title;
         base.parentPdTaskId = document.getElementById('et_parent').value;
-        base.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
+        base.productDesigner = productDesigner;
+        base.productManager = productManager;
+        base.engineers = engineers;
+        base.assignee = productDesigner || 'Unassigned';
         base.estDate = document.getElementById('et_date').value;
       }
       if(custom){
         custom.title = title;
         custom.parentPdTask = document.getElementById('et_parent').value;
-        custom.assignee = document.getElementById('et_assignee').value.trim() || 'Unassigned';
+        custom.productDesigner = productDesigner;
+        custom.productManager = productManager;
+        custom.engineers = engineers;
+        custom.assignee = productDesigner || 'Unassigned';
         custom.estDate = document.getElementById('et_date').value;
       }
       syncTaskStatus(uxrBoardState, id, status);
@@ -2160,7 +3212,9 @@ function openAddPdModal(presetStatus){
     <div class="field"><label>App *</label><select id="f_app"><option value="">—</option>${apps}</select></div>
     <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. New Onboarding Flow"></div>
     <div class="field"><label>Feature</label><select id="f_feature"><option value="">—</option></select></div>
-    <div class="field"><label>Assignee</label><input id="f_assignee" placeholder="e.g. Nancy Haddad"></div>
+    <div class="field"><label>Product Designer</label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Product Manager</label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
       <label>Optional statuses this task uses</label>
@@ -2172,6 +3226,7 @@ function openAddPdModal(presetStatus){
       <button class="btn primary" id="f_submit">Add task</button>
     </div>
   `);
+  enablePeopleFieldAutocomplete(['f_designer','f_pm','f_eng']);
   const appSelect = document.getElementById('f_app');
   const featureSelect = document.getElementById('f_feature');
   function renderFeatureOptions(){
@@ -2193,9 +3248,20 @@ function openAddPdModal(presetStatus){
     const fullStatusList = PD_STATUSES.map(s=>s.id);
     const alwaysStatuses = fullStatusList.filter(s=>!PD_CREATION_STATUSES.includes(s));
     const allowedStatuses = alwaysStatuses.concat(checked);
+    const pdPeople = parseTotersPeople(document.getElementById('f_designer').value.trim());
+    const pmPeople = parseTotersPeople(document.getElementById('f_pm').value.trim());
+    const engPeople = parseTotersPeople(document.getElementById('f_eng').value.trim());
+    if(!pdPeople.ok || !pmPeople.ok || !engPeople.ok){
+      const invalid = [...pdPeople.invalid, ...pmPeople.invalid, ...engPeople.invalid];
+      showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
+      return;
+    }
     addPdTask({
       title, appName, featureName: document.getElementById('f_feature').value,
-      assignee: document.getElementById('f_assignee').value.trim(), estDate: document.getElementById('f_date').value,
+      productDesigner: pdPeople.list.join(', '),
+      productManager: pmPeople.list.join(', '),
+      engineers: engPeople.list.join(', '),
+      estDate: document.getElementById('f_date').value,
       status:'Not Started',
       applicableStatuses: allowedStatuses.length===fullStatusList.length ? null : allowedStatuses
     });
@@ -2211,7 +3277,9 @@ function openAddUxrModal(presetStatus){
     <div class="d-empty" style="margin-bottom:8px">Fields marked with * are required.</div>
     <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. UXR_Checkout Friction Study"></div>
     <div class="field"><label>Linked PD task</label><select id="f_parent"><option value="">—</option>${pdOptions}</select></div>
-    <div class="field"><label>Assignee</label><input id="f_assignee" placeholder="e.g. Rana Khalil"></div>
+    <div class="field"><label>Product Designer</label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Product Manager</label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
       <label>Statuses this task uses</label>
@@ -2222,14 +3290,26 @@ function openAddUxrModal(presetStatus){
       <button class="btn primary" id="f_submit">Add task</button>
     </div>
   `);
+  enablePeopleFieldAutocomplete(['f_designer','f_pm','f_eng']);
   document.getElementById('f_submit').addEventListener('click', ()=>{
     const title = document.getElementById('f_title').value.trim();
     if(!title){ showToast('Give the task a name first'); return; }
     const checked = Array.from(document.querySelectorAll('#f_statuses input:checked')).map(cb=>cb.value);
     if(checked.length===0){ showToast('Pick at least one status this task uses'); return; }
+    const pdPeople = parseTotersPeople(document.getElementById('f_designer').value.trim());
+    const pmPeople = parseTotersPeople(document.getElementById('f_pm').value.trim());
+    const engPeople = parseTotersPeople(document.getElementById('f_eng').value.trim());
+    if(!pdPeople.ok || !pmPeople.ok || !engPeople.ok){
+      const invalid = [...pdPeople.invalid, ...pmPeople.invalid, ...engPeople.invalid];
+      showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
+      return;
+    }
     addUxrTask({
       title, parentPdTask: document.getElementById('f_parent').value,
-      assignee: document.getElementById('f_assignee').value.trim(), estDate: document.getElementById('f_date').value,
+      productDesigner: pdPeople.list.join(', '),
+      productManager: pmPeople.list.join(', '),
+      engineers: engPeople.list.join(', '),
+      estDate: document.getElementById('f_date').value,
       status:'Not Started', applicableStatuses: checked.length===UXR_STATUSES.length ? null : checked
     });
     closeModal();
@@ -2342,10 +3422,10 @@ ${DATA.features.map(f=>`- ${f.name}: apps=${(f.apps||[]).join(', ')||'—'} | pa
 PRODUCT AREAS: ${DATA.productAreas.map(a=>a.name).join(', ')}
 
 PD TASKS — live status (${pd.length} total):
-${pd.map(t=>`- "${t.title}" | app=${t.appName||'—'} | feature=${t.featureName||'—'} | status=${t.status} | assignee=${t.assignee} | due=${t.estDate||'—'}${isOverdue(t.estDate,t.status)?' [OVERDUE]':''}`).join('\n') || 'none'}
+${pd.map(t=>`- "${t.title}" | app=${t.appName||'—'} | feature=${t.featureName||'—'} | status=${t.status} | productDesigner=${t.productDesigner||t.assignee} | due=${t.estDate||'—'}${isOverdue(t.estDate,t.status)?' [OVERDUE]':''}`).join('\n') || 'none'}
 
 UXR TASKS — live status (${uxr.length} total):
-${uxr.map(t=>`- "${t.title}" | linked PD task=${t.parentPdTask||'—'} | status=${t.status} | assignee=${t.assignee}`).join('\n') || 'none'}
+${uxr.map(t=>`- "${t.title}" | linked PD task=${t.parentPdTask||'—'} | status=${t.status} | productDesigner=${t.productDesigner||t.assignee}`).join('\n') || 'none'}
 
 VALID PD STATUSES: ${pdOrder.join(', ')}
 VALID UXR STATUSES: ${uxrOrder.join(', ')}
@@ -2358,7 +3438,7 @@ COMPUTED INSIGHTS:
 
 NAVIGATION: when it would help, include exactly ONE of these tags naturally at the end of a sentence in your reply, and the portal will jump the user there automatically: [[nav:dashboard]] [[nav:database]] [[nav:iamap]] [[nav:boards]] — or to open a specific item's detail panel: [[open:app:ExactAppName]] [[open:feature:ExactFeatureName]] [[open:page:ExactPageName]] [[open:task:ExactTaskTitle]] (names must match the data above exactly, emoji included for app names).
 
-ACTIONS: if the user clearly asks you to create a new task, first briefly confirm what you're creating in plain language, then include exactly one tag at the very end: [[action:addPdTask:{"title":"...","appName":"...","featureName":"...","assignee":"...","estDate":"YYYY-MM-DD","status":"..."}]] for a PD task, or [[action:addUxrTask:{"title":"...","parentPdTask":"...","assignee":"...","estDate":"YYYY-MM-DD","status":"..."}]] for a UXR task. status must exactly match one of the VALID statuses listed above for that board. Use "" for any field you don't know. Only use an action tag when the user is clearly asking you to create something — never for questions.
+ACTIONS: if the user clearly asks you to create a new task, first briefly confirm what you're creating in plain language, then include exactly one tag at the very end: [[action:addPdTask:{"title":"...","appName":"...","featureName":"...","productDesigner":"...","productManager":"...","engineers":"...","estDate":"YYYY-MM-DD","status":"..."}]] for a PD task, or [[action:addUxrTask:{"title":"...","parentPdTask":"...","productDesigner":"...","productManager":"...","engineers":"...","estDate":"YYYY-MM-DD","status":"..."}]] for a UXR task. status must exactly match one of the VALID statuses listed above for that board. Use "" for any field you don't know. Only use an action tag when the user is clearly asking you to create something — never for questions.
 
 Never use more than one tag (nav/open/action) per reply, and never explain the tag syntax to the user.
 
@@ -2664,6 +3744,7 @@ const GOOGLE_CLIENT_ID = '967434872800-elhs19mc90i8fmapl2vlkc1n647eglag.apps.goo
 function applySignedInUser(user){
   const nameFromEmail = user.email.split('@')[0].replace(/[._]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
   const displayName = user.name || nameFromEmail;
+  upsertTotersPerson({email:user.email, name:displayName, image:user.image || ''});
   const avEl = document.getElementById('whoAvatar');
   const nameEl = document.getElementById('whoName');
   const emailEl = document.getElementById('whoEmail');
@@ -2686,6 +3767,8 @@ async function bootApp(user){
   showApp();
   await loadPortalData();
   await loadBoards();
+  await syncPdTasksFromSheet({showToastOnAdd:true});
+  startPdSheetSyncLoop();
   renderAll();
   await loadChatData();
   renderAllChatUI();
@@ -2706,7 +3789,7 @@ function handleGoogleCredential(response){
       showGoogleFallback(`Access is limited to @${ALLOWED_DOMAIN} accounts. Signed in as ${payload.email||'an unknown account'}, which isn't allowed — try again with your Toters Google account.`);
       return;
     }
-    const user = { email: payload.email, name: payload.name, signedInAt: new Date().toISOString(), via:'google' };
+    const user = { email: payload.email, name: payload.name, image: payload.picture || '', signedInAt: new Date().toISOString(), via:'google' };
     personalSet(SIGNIN_KEY, user).then(()=>bootApp(user));
   }catch(e){
     console.error('Google sign-in failed to parse credential', e);
@@ -2733,6 +3816,7 @@ function initGoogleSignIn(){
 }
 
 document.getElementById('signoutBtn').addEventListener('click', async ()=>{
+  stopPdSheetSyncLoop();
   await personalDelete(SIGNIN_KEY);
   showSignin();
 });
