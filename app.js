@@ -934,7 +934,8 @@ async function fetchSheetRowsFromBackend(){
     return null;
   }
 }
-function upsertSheetTasksFromMappedRows(mappedRows){
+function upsertSheetTasksFromMappedRows(mappedRows, options){
+  const respectTombstones = options && options.respectTombstones===false ? false : true;
   const customTasks = pdBoardState.tasksCustom || (pdBoardState.tasksCustom = []);
   const deletedSheetKeys = new Set(pdBoardState.deletedSheetKeys || []);
   const deletedSheetStableKeys = new Set(pdBoardState.deletedSheetStableKeys || []);
@@ -963,7 +964,7 @@ function upsertSheetTasksFromMappedRows(mappedRows){
     const missingRequiredFields = Array.isArray(item.missingRequiredFields) ? item.missingRequiredFields : missingRequiredFieldsForSheetTask({title, appName, productDesigner, productManager, startDate, estDate});
     const key = item.sheetKey || sheetTaskKey(title, appName);
     const stableKey = sheetTaskKey(title, appName);
-    if(deletedSheetKeys.has(key) || deletedSheetStableKeys.has(stableKey)) return;
+    if(respectTombstones && (deletedSheetKeys.has(key) || deletedSheetStableKeys.has(stableKey))) return;
     seenSheetKeys.add(key);
 
     let existing = sheetByKey.get(key);
@@ -1046,7 +1047,7 @@ async function syncPdTasksFromSheet(options){
         ['sheetKey','request title','application','product designer','product manager','notes','added_by','expected start time','expected deadline'],
         backendRows.map(r=>[r.sheetKey||'', r.title, r.appName, r.productDesigner||r.assignee, r.productManager||'', r.notes||'', r.addedBy||'google_sheet', r.startDate, r.estDate])
       );
-      const result = upsertSheetTasksFromMappedRows(backendRows);
+      const result = upsertSheetTasksFromMappedRows(backendRows, {respectTombstones:false});
       if(result.added || result.updated || result.removed){
         await storageSet('pd-board-state', pdBoardState);
         renderAll();
@@ -1123,7 +1124,7 @@ async function syncPdTasksFromSheet(options){
         estDate: toIsoDate(idxDeadline>=0 ? cols[idxDeadline] : '')
       });
     });
-    const result = upsertSheetTasksFromMappedRows(mappedRows);
+    const result = upsertSheetTasksFromMappedRows(mappedRows, {respectTombstones:false});
 
     if(result.added || result.updated || result.removed){
       await storageSet('pd-board-state', pdBoardState);
