@@ -124,7 +124,17 @@ const PD_SHEET_CSV_URLS = [
 const PD_SHEET_GVIZ_JSONP_URL = `https://docs.google.com/spreadsheets/d/${PD_SHEET_ID}/gviz/tq?tqx=out:json`;
 const PD_LOCAL_CSV_URLS = ['./pd-sheet.csv', './pd_tasks_sheet.csv'];
 const PD_SHEET_POLL_MS = 15000;
-const PD_SHEET_BACKEND_URL = 'http://localhost:8787';
+function resolveSheetBackendUrl(){
+  const explicit = String(localStorage.getItem('design-ops-backend-url') || '').trim();
+  if(explicit) return explicit.replace(/\/+$/,'');
+  const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+  const host = window.location.hostname;
+  if(host && host !== 'localhost' && host !== '127.0.0.1'){
+    return `${protocol}//${host}:8787`;
+  }
+  return 'http://localhost:8787';
+}
+const PD_SHEET_BACKEND_URL = resolveSheetBackendUrl();
 const TOTERS_EMAIL_DOMAIN = 'totersapp.com';
 const STATIC_DESIGNER_EMAILS = [
   'nancy.haddad@totersapp.com',
