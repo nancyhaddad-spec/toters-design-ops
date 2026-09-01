@@ -126,6 +126,13 @@ const PD_LOCAL_CSV_URLS = ['./pd-sheet.csv', './pd_tasks_sheet.csv'];
 const PD_SHEET_POLL_MS = 15000;
 const PD_SHEET_BACKEND_URL = 'http://localhost:8787';
 const TOTERS_EMAIL_DOMAIN = 'totersapp.com';
+const STATIC_DESIGNER_EMAILS = [
+  'nancy.haddad@totersapp.com',
+  'karim.nadar@totersapp.com',
+  'merissa.s@totersapp.com',
+  'john.homsy@totersapp.com',
+  'nour.eid@totersapp.com'
+];
 const PD_SHEET_REQUIRED_FIELDS = [
   {key:'title', label:'Request Title'},
   {key:'appName', label:'Application'},
@@ -219,6 +226,49 @@ function normalizePeopleCsv(raw){
     out.push(v);
   });
   return out.join(', ');
+}
+function getCurrentUserEmail(){
+  const email = (document.getElementById('whoEmail')?.textContent || '').trim().toLowerCase();
+  return isTotersEmail(email) ? email : '';
+}
+function getTeamDesignerEmails(){
+  const set = new Set(STATIC_DESIGNER_EMAILS.map(normalizePersonEmail).filter(isTotersEmail));
+  function addFrom(raw){
+    splitPeople(raw).forEach(e=>{ if(isTotersEmail(e)) set.add(normalizePersonEmail(e)); });
+  }
+  getAllPdTasks().forEach(t=>addFrom(t.productDesigner||t.assignee));
+  getAllUxrTasks().forEach(t=>addFrom(t.productDesigner||t.assignee));
+  const me = getCurrentUserEmail();
+  if(me) set.add(me);
+  return set;
+}
+function clearFieldErrorByInput(input){
+  if(!input) return;
+  input.classList.remove('input-error');
+  const field = input.closest('.field');
+  if(!field) return;
+  const error = field.querySelector('.field-error');
+  if(error) error.remove();
+}
+function setFieldErrorByInput(input, message){
+  if(!input) return;
+  input.classList.add('input-error');
+  const field = input.closest('.field');
+  if(!field) return;
+  let error = field.querySelector('.field-error');
+  if(!error){
+    error = document.createElement('div');
+    error.className = 'field-error';
+    field.appendChild(error);
+  }
+  error.textContent = message;
+}
+function validateRequiredInput(input, label){
+  clearFieldErrorByInput(input);
+  const value = String(input && input.value || '').trim();
+  if(value) return true;
+  setFieldErrorByInput(input, `${label} is required`);
+  return false;
 }
 function upsertTotersPerson(profile){
   const email = normalizePersonEmail(profile && profile.email);
@@ -323,12 +373,17 @@ function tokenRangeForPeople(value, caret){
   const tokenEnd = nextComma===-1 ? safeValue.length : pos + nextComma;
   return {tokenStart, tokenEnd, token: safeValue.slice(tokenStart, tokenEnd).trim()};
 }
-function attachPeopleAutocomplete(inputId){
+function attachPeopleAutocomplete(inputId, options){
   const input = document.getElementById(inputId);
   if(!input) return;
+  const opts = options || {};
   const field = input.closest('.field') || input.parentElement;
   if(!field) return;
-  const directory = collectTotersDirectory();
+  function getDirectory(){
+    let list = collectTotersDirectory();
+    if(typeof opts.filter === 'function') list = list.filter(opts.filter);
+    return list;
+  }
   const menu = document.createElement('div');
   menu.className = 'people-suggest-menu';
   menu.style.display = 'none';
@@ -353,6 +408,7 @@ function attachPeopleAutocomplete(inputId){
     input.dispatchEvent(new Event('input', {bubbles:true}));
   }
   function renderMenu(){
+    const directory = getDirectory();
     const range = tokenRangeForPeople(input.value, input.selectionStart);
     const items = getPeopleSuggestions(range.token, directory);
     if(!items.length){ hideMenu(); return; }
@@ -389,8 +445,17 @@ function attachPeopleAutocomplete(inputId){
   });
   input.addEventListener('blur', ()=>setTimeout(hideMenu, 120));
 }
-function enablePeopleFieldAutocomplete(ids){
-  ids.forEach(id=>attachPeopleAutocomplete(id));
+function enablePeopleFieldAutocomplete(configs){
+  (configs||[]).forEach(cfg=>{
+    if(typeof cfg==='string') attachPeopleAutocomplete(cfg);
+    else attachPeopleAutocomplete(cfg.id, cfg.options || {});
+  });
+}
+function defaultOwnerToCurrentUser(inputId){
+  const input = document.getElementById(inputId);
+  if(!input || String(input.value||'').trim()) return;
+  const me = getCurrentUserEmail();
+  if(me) input.value = me;
 }
 function personAvatarHtml(email, fallbackLabel){
   const profile = personProfileByEmail(email);
@@ -3068,13 +3133,13 @@ function editTask(board, id){
   openModal(`
     <h3>Edit ${board.toUpperCase()} task</h3>
     ${board==='pd' ? `<div class="d-empty" style="margin-bottom:8px">${PD_REQUIRED_FIELD_HINT}</div>` : ''}
-    <div class="field"><label>Task name</label><input id="et_title" value="${escAttr(task.title)}"></div>
+    <div class="field"><label>Task name <span class="req-star">*</span></label><input id="et_title" value="${escAttr(task.title)}"></div>
     ${board==='pd'
       ? `<div class="field"><label>App *</label><select id="et_app"><option value="">—</option>${apps}</select></div><div class="field"><label>Feature</label><select id="et_feature"><option value="">—</option>${feats}</select></div>`
       : `<div class="field"><label>Linked PD task</label><select id="et_parent"><option value="">—</option>${pdOpts}</select></div>`
     }
-    <div class="field"><label>Product Designer${board==='pd' ? ' *' : ''}</label><input id="et_designer" value="${escAttr(task.productDesigner||task.assignee||'')}" placeholder="name@totersapp.com, ..."></div>
-    <div class="field"><label>Product Manager${board==='pd' ? ' *' : ''}</label><input id="et_pm" value="${escAttr(task.productManager||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Owner <span class="req-star">*</span></label><input id="et_designer" value="${escAttr(task.productDesigner||task.assignee||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>PM <span class="req-star">*</span></label><input id="et_pm" value="${escAttr(task.productManager||'')}" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Engineers</label><input id="et_eng" value="${escAttr(task.engineers||'')}" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Expected start date</label><input id="et_start_date" type="date" value="${escAttr(task.startDate||'')}"></div>
     <div class="field"><label>Estimated date</label><input id="et_date" type="date" value="${escAttr(task.estDate||'')}"></div>
@@ -3086,7 +3151,13 @@ function editTask(board, id){
       <button class="btn primary" id="et_save">Save</button>
     </div>
   `);
-  enablePeopleFieldAutocomplete(['et_designer','et_pm','et_eng']);
+  const designerAllowlist = getTeamDesignerEmails();
+  enablePeopleFieldAutocomplete([
+    {id:'et_designer', options:{filter:p=>designerAllowlist.has(normalizePersonEmail(p.email))}},
+    {id:'et_pm'},
+    {id:'et_eng'}
+  ]);
+  defaultOwnerToCurrentUser('et_designer');
   const linksToggle = document.getElementById('et_links_toggle');
   if(linksToggle){
     linksToggle.addEventListener('click', ()=>{
@@ -3102,14 +3173,32 @@ function editTask(board, id){
   });
   document.getElementById('et_save').addEventListener('click', async ()=>{
     const title = document.getElementById('et_title').value.trim();
+    const titleInput = document.getElementById('et_title');
+    const appInput = board==='pd' ? document.getElementById('et_app') : null;
+    const ownerInput = document.getElementById('et_designer');
+    const pmInput = document.getElementById('et_pm');
+    const engInput = document.getElementById('et_eng');
+    [titleInput, appInput, ownerInput, pmInput, engInput].forEach(clearFieldErrorByInput);
+    let valid = true;
+    valid = validateRequiredInput(titleInput, 'Task name') && valid;
+    if(board==='pd') valid = validateRequiredInput(appInput, 'Application') && valid;
+    valid = validateRequiredInput(ownerInput, 'Owner') && valid;
+    valid = validateRequiredInput(pmInput, 'PM') && valid;
+    if(!valid){ showToast('Please complete required fields'); return; }
     if(!title){ showToast('Task name is required'); return; }
     const status = document.getElementById('et_status').value;
-    const pdPeople = parseTotersPeople(document.getElementById('et_designer').value.trim());
-    const pmPeople = parseTotersPeople(document.getElementById('et_pm').value.trim());
-    const engPeople = parseTotersPeople(document.getElementById('et_eng').value.trim());
+    const pdPeople = parseTotersPeople(ownerInput.value.trim());
+    const pmPeople = parseTotersPeople(pmInput.value.trim());
+    const engPeople = parseTotersPeople(engInput.value.trim());
     if(!pdPeople.ok || !pmPeople.ok || !engPeople.ok){
       const invalid = [...pdPeople.invalid, ...pmPeople.invalid, ...engPeople.invalid];
       showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
+      return;
+    }
+    const disallowedOwners = pdPeople.list.filter(e=>!designerAllowlist.has(normalizePersonEmail(e)));
+    if(disallowedOwners.length){
+      setFieldErrorByInput(ownerInput, `Owner must be from designer list: ${disallowedOwners.join(', ')}`);
+      showToast('Owner must be a team designer email');
       return;
     }
     const productDesigner = pdPeople.list.join(', ');
@@ -3212,11 +3301,11 @@ function openAddPdModal(presetStatus){
   openModal(`
     <h3>New PD task</h3>
     <div class="d-empty" style="margin-bottom:8px">${PD_REQUIRED_FIELD_HINT}</div>
-    <div class="field"><label>App *</label><select id="f_app"><option value="">—</option>${apps}</select></div>
-    <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. New Onboarding Flow"></div>
+    <div class="field"><label>App <span class="req-star">*</span></label><select id="f_app"><option value="">—</option>${apps}</select></div>
+    <div class="field"><label>Task name <span class="req-star">*</span></label><input id="f_title" placeholder="e.g. New Onboarding Flow"></div>
     <div class="field"><label>Feature</label><select id="f_feature"><option value="">—</option></select></div>
-    <div class="field"><label>Product Designer *</label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
-    <div class="field"><label>Product Manager *</label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Owner <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>PM <span class="req-star">*</span></label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
@@ -3229,7 +3318,13 @@ function openAddPdModal(presetStatus){
       <button class="btn primary" id="f_submit">Add task</button>
     </div>
   `);
-  enablePeopleFieldAutocomplete(['f_designer','f_pm','f_eng']);
+  const designerAllowlist = getTeamDesignerEmails();
+  enablePeopleFieldAutocomplete([
+    {id:'f_designer', options:{filter:p=>designerAllowlist.has(normalizePersonEmail(p.email))}},
+    {id:'f_pm'},
+    {id:'f_eng'}
+  ]);
+  defaultOwnerToCurrentUser('f_designer');
   const appSelect = document.getElementById('f_app');
   const featureSelect = document.getElementById('f_feature');
   function renderFeatureOptions(){
@@ -3243,20 +3338,36 @@ function openAddPdModal(presetStatus){
   appSelect.addEventListener('change', renderFeatureOptions);
   renderFeatureOptions();
   document.getElementById('f_submit').addEventListener('click', ()=>{
-    const title = document.getElementById('f_title').value.trim();
-    if(!title){ showToast('Give the task a name first'); return; }
-    const appName = document.getElementById('f_app').value;
-    if(!appName){ showToast('Pick an app first'); return; }
+    const titleInput = document.getElementById('f_title');
+    const appInput = document.getElementById('f_app');
+    const ownerInput = document.getElementById('f_designer');
+    const pmInput = document.getElementById('f_pm');
+    const engInput = document.getElementById('f_eng');
+    [titleInput, appInput, ownerInput, pmInput, engInput].forEach(clearFieldErrorByInput);
+    let valid = true;
+    valid = validateRequiredInput(titleInput, 'Task name') && valid;
+    valid = validateRequiredInput(appInput, 'Application') && valid;
+    valid = validateRequiredInput(ownerInput, 'Owner') && valid;
+    valid = validateRequiredInput(pmInput, 'PM') && valid;
+    if(!valid){ showToast('Please complete required fields'); return; }
+    const title = titleInput.value.trim();
+    const appName = appInput.value;
     const checked = Array.from(document.querySelectorAll('#f_statuses input:checked')).map(cb=>cb.value);
     const fullStatusList = PD_STATUSES.map(s=>s.id);
     const alwaysStatuses = fullStatusList.filter(s=>!PD_CREATION_STATUSES.includes(s));
     const allowedStatuses = alwaysStatuses.concat(checked);
-    const pdPeople = parseTotersPeople(document.getElementById('f_designer').value.trim());
-    const pmPeople = parseTotersPeople(document.getElementById('f_pm').value.trim());
-    const engPeople = parseTotersPeople(document.getElementById('f_eng').value.trim());
+    const pdPeople = parseTotersPeople(ownerInput.value.trim());
+    const pmPeople = parseTotersPeople(pmInput.value.trim());
+    const engPeople = parseTotersPeople(engInput.value.trim());
     if(!pdPeople.ok || !pmPeople.ok || !engPeople.ok){
       const invalid = [...pdPeople.invalid, ...pmPeople.invalid, ...engPeople.invalid];
       showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
+      return;
+    }
+    const disallowedOwners = pdPeople.list.filter(e=>!designerAllowlist.has(normalizePersonEmail(e)));
+    if(disallowedOwners.length){
+      setFieldErrorByInput(ownerInput, `Owner must be from designer list: ${disallowedOwners.join(', ')}`);
+      showToast('Owner must be a team designer email');
       return;
     }
     if(!pdPeople.list.length){ showToast('Product Designer is required'); return; }
@@ -3279,11 +3390,11 @@ function openAddUxrModal(presetStatus){
   const statusChecks = UXR_STATUSES.map(s=>`<label class="status-check"><input type="checkbox" value="${escAttr(s.id)}" checked> ${escapeHtml(s.id)}</label>`).join('');
   openModal(`
     <h3>New UXR task</h3>
-    <div class="d-empty" style="margin-bottom:8px">Fields marked with * are required.</div>
+    <div class="d-empty" style="margin-bottom:8px">Required fields: Task Name, Owner, PM.</div>
     <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. UXR_Checkout Friction Study"></div>
     <div class="field"><label>Linked PD task</label><select id="f_parent"><option value="">—</option>${pdOptions}</select></div>
-    <div class="field"><label>Product Designer</label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
-    <div class="field"><label>Product Manager</label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Owner <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>PM <span class="req-star">*</span></label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
@@ -3295,18 +3406,39 @@ function openAddUxrModal(presetStatus){
       <button class="btn primary" id="f_submit">Add task</button>
     </div>
   `);
-  enablePeopleFieldAutocomplete(['f_designer','f_pm','f_eng']);
+  const designerAllowlist = getTeamDesignerEmails();
+  enablePeopleFieldAutocomplete([
+    {id:'f_designer', options:{filter:p=>designerAllowlist.has(normalizePersonEmail(p.email))}},
+    {id:'f_pm'},
+    {id:'f_eng'}
+  ]);
+  defaultOwnerToCurrentUser('f_designer');
   document.getElementById('f_submit').addEventListener('click', ()=>{
-    const title = document.getElementById('f_title').value.trim();
-    if(!title){ showToast('Give the task a name first'); return; }
+    const titleInput = document.getElementById('f_title');
+    const ownerInput = document.getElementById('f_designer');
+    const pmInput = document.getElementById('f_pm');
+    const engInput = document.getElementById('f_eng');
+    [titleInput, ownerInput, pmInput, engInput].forEach(clearFieldErrorByInput);
+    let valid = true;
+    valid = validateRequiredInput(titleInput, 'Task name') && valid;
+    valid = validateRequiredInput(ownerInput, 'Owner') && valid;
+    valid = validateRequiredInput(pmInput, 'PM') && valid;
+    if(!valid){ showToast('Please complete required fields'); return; }
+    const title = titleInput.value.trim();
     const checked = Array.from(document.querySelectorAll('#f_statuses input:checked')).map(cb=>cb.value);
     if(checked.length===0){ showToast('Pick at least one status this task uses'); return; }
-    const pdPeople = parseTotersPeople(document.getElementById('f_designer').value.trim());
-    const pmPeople = parseTotersPeople(document.getElementById('f_pm').value.trim());
-    const engPeople = parseTotersPeople(document.getElementById('f_eng').value.trim());
+    const pdPeople = parseTotersPeople(ownerInput.value.trim());
+    const pmPeople = parseTotersPeople(pmInput.value.trim());
+    const engPeople = parseTotersPeople(engInput.value.trim());
     if(!pdPeople.ok || !pmPeople.ok || !engPeople.ok){
       const invalid = [...pdPeople.invalid, ...pmPeople.invalid, ...engPeople.invalid];
       showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
+      return;
+    }
+    const disallowedOwners = pdPeople.list.filter(e=>!designerAllowlist.has(normalizePersonEmail(e)));
+    if(disallowedOwners.length){
+      setFieldErrorByInput(ownerInput, `Owner must be from designer list: ${disallowedOwners.join(', ')}`);
+      showToast('Owner must be a team designer email');
       return;
     }
     addUxrTask({

@@ -604,6 +604,9 @@ table.tstat tr:last-child td{border-bottom:none;}
   font-size:13px;color:var(--ink);outline:none;
 }
 .field select{padding-right:34px;}
+.field .req-star{color:var(--danger);font-weight:800;margin-left:2px;}
+.field .field-error{margin-top:5px;font-size:11px;color:var(--danger);font-weight:600;}
+.field input.input-error,.field select.input-error,.field textarea.input-error{border-color:var(--danger)!important;background:#fff6f6;}
 .field input:focus, .field select:focus, .field textarea:focus{border-color:var(--accent);}
 .field textarea{resize:vertical;min-height:56px;}
 .status-checks{display:flex;flex-wrap:wrap;gap:6px;}
