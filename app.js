@@ -214,12 +214,11 @@ function auditSheetTaskRequiredFieldsInState(){
   return changed;
 }
 function taskUsesViewerStatusIsolation(task){
-  return task && (task.statusScope==='viewer' || task.statusIsolation==='viewer');
+  // Global consistency mode: statuses are shared for everyone.
+  return false;
 }
 function getEffectiveTaskStatus(board, task, globalStatus){
-  if(!taskUsesViewerStatusIsolation(task)) return globalStatus;
-  const scoped = viewerStatusOverrides[board] || {};
-  return scoped[task.id] || globalStatus;
+  return globalStatus;
 }
 function isTotersEmail(v){
   const email = String(v||'').trim().toLowerCase();
@@ -1473,14 +1472,6 @@ async function moveTask(board, id, newStatus){
   const allowed = normalizeAllowedStatuses(board, st.applicableStatuses || null);
   if(!allowed.includes(newStatus)){
     showToast('This task doesn\u2019t use the "'+newStatus+'" status');
-    return;
-  }
-  if(taskUsesViewerStatusIsolation(task)){
-    viewerStatusOverrides[board] = viewerStatusOverrides[board] || {};
-    viewerStatusOverrides[board][id] = newStatus;
-    await saveViewerStatusOverrides();
-    renderAll();
-    showToast('Updated your personal status view');
     return;
   }
   syncTaskStatus(store, id, newStatus);
@@ -4213,6 +4204,9 @@ async function bootApp(user){
   applySignedInUser(user);
   showApp();
   await loadViewerStatusOverrides();
+  // Clear any old per-user overrides so all users see the same statuses.
+  viewerStatusOverrides = {pd:{}, uxr:{}};
+  await personalDelete(VIEWER_STATUS_OVERRIDES_KEY);
   await loadPortalData();
   await loadBoards();
   await syncPdTasksFromSheet({showToastOnAdd:true});
