@@ -311,6 +311,12 @@ function emailToDisplayName(email){
   const local = normalized.split('@')[0];
   return local.replace(/[._-]+/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
 }
+function displayUserLabel(raw){
+  const normalized = normalizeCol(raw);
+  if(normalized==='google_sheet' || normalized==='google sheet') return 'Google Sheet Sync';
+  if(normalized==='user') return 'User';
+  return emailToDisplayName(raw);
+}
 function peopleDisplayPrimary(raw){
   const first = splitPeople(raw)[0];
   return first ? emailToDisplayName(first) : 'Unassigned';
@@ -957,8 +963,8 @@ async function syncPdTasksFromSheet(options){
     const backendRows = await fetchSheetRowsFromBackend();
     if(backendRows){
       const backendSignature = buildSheetSignature(
-        ['sheetKey','request title','application','product designer','product manager','expected start time','expected deadline'],
-        backendRows.map(r=>[r.sheetKey||'', r.title, r.appName, r.productDesigner||r.assignee, r.productManager||'', r.startDate, r.estDate])
+        ['sheetKey','request title','application','product designer','product manager','notes','added_by','expected start time','expected deadline'],
+        backendRows.map(r=>[r.sheetKey||'', r.title, r.appName, r.productDesigner||r.assignee, r.productManager||'', r.notes||'', r.addedBy||'google_sheet', r.startDate, r.estDate])
       );
       const result = upsertSheetTasksFromMappedRows(backendRows);
       if(result.added || result.updated || result.removed){
@@ -1081,11 +1087,61 @@ function stopPdSheetSyncLoop(){
   clearInterval(pdSheetSyncTimer);
   pdSheetSyncTimer = null;
 }
+async function refreshGlobalTaskState(){
+  const [sharedData, sharedPd, sharedUxr] = await Promise.all([
+    storageGet(PORTAL_DATA_KEY),
+    storageGet('pd-board-state'),
+    storageGet('uxr-board-state')
+  ]);
+  let changed = false;
+  if(sharedData){
+    const currentSig = JSON.stringify(DATA);
+    const nextSig = JSON.stringify(sharedData);
+    if(currentSig!==nextSig){
+      applyPersistedData(sharedData);
+      rebuildLookups();
+      changed = true;
+    }
+  }
+  if(sharedPd){
+    const current = JSON.stringify(pdBoardState);
+    const next = JSON.stringify(sharedPd);
+    if(current!==next){
+      pdBoardState = sharedPd;
+      changed = true;
+    }
+  }
+  if(sharedUxr){
+    const current = JSON.stringify(uxrBoardState);
+    const next = JSON.stringify(sharedUxr);
+    if(current!==next){
+      uxrBoardState = sharedUxr;
+      changed = true;
+    }
+  }
+  if(changed){
+    auditSheetTaskRequiredFieldsInState();
+    renderAll();
+  }
+}
+function startGlobalTaskSyncLoop(){
+  if(globalTaskSyncTimer) clearInterval(globalTaskSyncTimer);
+  globalTaskSyncTimer = setInterval(()=>{
+    if(document.visibilityState==='visible') refreshGlobalTaskState();
+  }, 8000);
+}
+function stopGlobalTaskSyncLoop(){
+  if(!globalTaskSyncTimer) return;
+  clearInterval(globalTaskSyncTimer);
+  globalTaskSyncTimer = null;
+}
 
 window.addEventListener('focus', ()=>{ syncPdTasksFromSheet({force:true}); });
+window.addEventListener('focus', ()=>{ refreshGlobalTaskState(); });
 document.addEventListener('visibilitychange', ()=>{
   if(document.visibilityState === 'visible'){
     syncPdTasksFromSheet({force:true});
+    refreshGlobalTaskState();
   }
 });
 
@@ -2814,7 +2870,7 @@ function goToMapNode(key){
    BOARDS PAGE CONTROLLER (subtabs + filters)
    ============================================================ */
 let activeBoard = 'pd';
-let boardFilters = {app:'', pd:'', uxr:''};
+let boardFilters = {app:'', pd:'', uxr:'', user:''};
 
 const BOARD_COPY = {
   pd: {title:'PD task board', sub:'Product design tasks, tracked through the 8-stage design workflow. Drag a card between columns to update its status.'},
@@ -2825,6 +2881,7 @@ function populateBoardFilters(){
   const appSel = document.getElementById('filterApp');
   const pdSel = document.getElementById('filterPd');
   const uxrSel = document.getElementById('filterUxr');
+  const userSel = document.getElementById('filterUser');
 
   const appNames = DATA.apps.map(a=>a.name).sort();
   appSel.innerHTML = `<option value="">All apps</option>` + appNames.map(n=>`<option value="${escAttr(n)}">${escapeHtml(n)}</option>`).join('');
@@ -2851,6 +2908,32 @@ function populateBoardFilters(){
     .sort((a,b)=>a[1].localeCompare(b[1]))
     .map(([key,label])=>`<option value="${escAttr(key)}">${escapeHtml(label)}</option>`).join('');
   uxrSel.value = boardFilters.uxr;
+
+  if(userSel){
+    const userMap = new Map();
+    function addUser(raw){
+      splitPeople(raw).forEach(p=>{
+        const label = emailToDisplayName(p);
+        const key = peopleFilterKey(p);
+        if(key && !userMap.has(key)) userMap.set(key, label);
+      });
+    }
+    const all = getAllPdTasks().concat(getAllUxrTasks());
+    all.forEach(t=>{
+      addUser(t.productDesigner||t.assignee);
+      addUser(t.productManager);
+      addUser(t.engineers);
+      const creator = String(t.addedBy||t.added_by||'').trim();
+      if(creator){
+        const key = peopleFilterKey(creator);
+        if(key && !userMap.has(key)) userMap.set(key, displayUserLabel(creator));
+      }
+    });
+    userSel.innerHTML = `<option value="">All users</option>` + [...userMap.entries()]
+      .sort((a,b)=>a[1].localeCompare(b[1]))
+      .map(([key,label])=>`<option value="${escAttr(key)}">${escapeHtml(label)}</option>`).join('');
+    userSel.value = boardFilters.user;
+  }
 }
 
 function renderBoardsPage(){
@@ -2874,11 +2957,14 @@ document.getElementById('boardSubtabs').addEventListener('click', e=>{
 document.getElementById('filterApp').addEventListener('change', e=>{ boardFilters.app = e.target.value; renderBoard(activeBoard); });
 document.getElementById('filterPd').addEventListener('change', e=>{ boardFilters.pd = e.target.value; renderBoard(activeBoard); });
 document.getElementById('filterUxr').addEventListener('change', e=>{ boardFilters.uxr = e.target.value; renderBoard(activeBoard); });
+const userFilterEl = document.getElementById('filterUser');
+if(userFilterEl) userFilterEl.addEventListener('change', e=>{ boardFilters.user = e.target.value; renderBoard(activeBoard); });
 document.getElementById('clearFiltersBtn').addEventListener('click', ()=>{
-  boardFilters = {app:'', pd:'', uxr:''};
+  boardFilters = {app:'', pd:'', uxr:'', user:''};
   document.getElementById('filterApp').value = '';
   document.getElementById('filterPd').value = '';
   document.getElementById('filterUxr').value = '';
+  if(userFilterEl) userFilterEl.value = '';
   renderBoard(activeBoard);
 });
 document.getElementById('viewLogBtn').addEventListener('click', ()=>{
@@ -2903,6 +2989,16 @@ function applyBoardFilters(board, tasks){
     if(board==='uxr' && boardFilters.uxr){
       const names = splitPeople(t.productDesigner||t.assignee).map(peopleFilterKey);
       if(!names.includes(boardFilters.uxr)) return false;
+    }
+    if(boardFilters.user){
+      const pool = []
+        .concat(splitPeople(t.productDesigner||t.assignee))
+        .concat(splitPeople(t.productManager))
+        .concat(splitPeople(t.engineers));
+      const creator = String(t.addedBy||t.added_by||'').trim();
+      if(creator) pool.push(creator);
+      const keys = pool.map(peopleFilterKey);
+      if(!keys.includes(boardFilters.user)) return false;
     }
     return true;
   });
@@ -3042,7 +3138,7 @@ function openPdCardDetail(id){
     <div class="t-meta">
       ${t.appName?`<span class="tag acc">${escapeHtml(t.appName)}</span>`:''}
       <span class="tag">Product Designer: ${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</span>
-      <span class="tag">Added by: ${escapeHtml(t.addedBy||t.added_by||'user')}</span>
+      <span class="tag">Added by: ${escapeHtml(displayUserLabel(t.addedBy||t.added_by||'user'))}</span>
       ${t.startDate?`<span class="tag">Start ${fmtDate(t.startDate)}</span>`:''}
       ${t.estDate?`<span class="tag ${isOverdue(t.estDate,t.status)?'':''}" style="${isOverdue(t.estDate,t.status)?'background:var(--danger-soft);color:#A8332A':''}">Due ${fmtDate(t.estDate)}</span>`:''}
     </div>
@@ -3096,7 +3192,7 @@ function openUxrCardDetail(id){
     <h2>${escapeHtml(t.title)}</h2>
     <div class="t-meta">
       <span class="tag">Product Designer: ${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</span>
-      <span class="tag">Added by: ${escapeHtml(t.addedBy||t.added_by||'user')}</span>
+      <span class="tag">Added by: ${escapeHtml(displayUserLabel(t.addedBy||t.added_by||'user'))}</span>
       ${t.estDate?`<span class="tag">Due ${fmtDate(t.estDate)}</span>`:''}
     </div>
     <details class="d-section notes-section">
@@ -4016,10 +4112,12 @@ function showSignin(){
 async function bootApp(user){
   applySignedInUser(user);
   showApp();
+  await loadViewerStatusOverrides();
   await loadPortalData();
   await loadBoards();
   await syncPdTasksFromSheet({showToastOnAdd:true});
   startPdSheetSyncLoop();
+  startGlobalTaskSyncLoop();
   renderAll();
   await loadChatData();
   renderAllChatUI();
@@ -4068,6 +4166,7 @@ function initGoogleSignIn(){
 
 document.getElementById('signoutBtn').addEventListener('click', async ()=>{
   stopPdSheetSyncLoop();
+  stopGlobalTaskSyncLoop();
   await personalDelete(SIGNIN_KEY);
   showSignin();
 });

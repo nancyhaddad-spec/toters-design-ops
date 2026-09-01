@@ -242,6 +242,7 @@ function mapTasksFromTable(table, dataCellRows){
   const idxDeadline = findHeaderIndex(headers, ['Expected Deadline', 'Expected Due Date', 'Deadline', 'Due Date']);
   const idxPd = findHeaderIndex(headers, ['Product Designer', 'Designer', 'PD']);
   const idxPm = findHeaderIndex(headers, ['Product Manager', 'PM', 'PM Name', 'Product Manager Email']);
+  const idxNotes = findHeaderIndex(headers, ['Notes', 'Task Notes', 'Description']);
   if(idxTitle<0 || idxApp<0){
     throw new Error(`CSV_HEADERS_INVALID: ${headers.join(', ')}`);
   }
@@ -260,6 +261,7 @@ function mapTasksFromTable(table, dataCellRows){
     managerCell.people.forEach(p=>mergePerson(peopleByEmail, p));
     const productDesignerRaw = designerCell.value;
     const productManagerRaw = managerCell.value;
+    const notesRaw = ((idxNotes>=0 ? cols[idxNotes] : '') || '').trim();
     const startDate = toIsoDate(idxStart>=0 ? cols[idxStart] : '');
     const estDate = toIsoDate(idxDeadline>=0 ? cols[idxDeadline] : '');
     const reqMissing = missingRequiredFields({
@@ -278,6 +280,9 @@ function mapTasksFromTable(table, dataCellRows){
       productDesigner: productDesignerRaw,
       productManager: productManagerRaw,
       engineers: '',
+      notes: notesRaw,
+      addedBy: 'google_sheet',
+      added_by: 'google_sheet',
       assignee: productDesignerRaw || 'Unassigned',
       startDate,
       estDate,
@@ -285,8 +290,8 @@ function mapTasksFromTable(table, dataCellRows){
     });
   });
   const nextSignature = buildSignature(
-    ['sheetKey','title','appName','productDesigner','productManager','startDate','estDate'],
-    nextTasks.map(t=>[t.sheetKey,t.title,t.appName,t.productDesigner,t.productManager,t.startDate,t.estDate])
+    ['sheetKey','title','appName','productDesigner','productManager','notes','added_by','startDate','estDate'],
+    nextTasks.map(t=>[t.sheetKey,t.title,t.appName,t.productDesigner,t.productManager,t.notes||'',t.addedBy||'google_sheet',t.startDate,t.estDate])
   );
   return {nextSignature, nextTasks, peopleDirectory:[...peopleByEmail.values()]};
 }
