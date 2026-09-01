@@ -879,8 +879,17 @@ function reportSheetSyncError(msg){
   }
 }
 async function fetchSheetRowsFromBackend(){
+  const fetchWithTimeout = async (url, ms)=>{
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), ms);
+    try{
+      return await fetch(url, {cache:'no-store', signal: controller.signal});
+    }finally{
+      clearTimeout(timer);
+    }
+  };
   try{
-    const res = await fetch(`${PD_SHEET_BACKEND_URL}/api/pd-sheet/tasks`, {cache:'no-store'});
+    const res = await fetchWithTimeout(`${PD_SHEET_BACKEND_URL}/api/pd-sheet/tasks`, 3500);
     if(!res.ok){
       pdBackendState = 'disconnected';
       renderBackendIndicator();
