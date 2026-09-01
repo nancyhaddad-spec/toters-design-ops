@@ -142,6 +142,7 @@ const PD_SHEET_REQUIRED_FIELDS = [
 const PD_REQUIRED_FIELD_HINT = 'Required fields: Task Name, Application, Product Designer, Product Manager.';
 let pdSheetSyncTimer = null;
 let pdSheetSyncRunning = false;
+let globalTaskSyncTimer = null;
 let pdSheetLastErrorAt = 0;
 let pdSheetLastErrorMsg = '';
 let pdSheetLastSignature = '';
@@ -150,6 +151,8 @@ let pdSheetLastStatus = 'idle'; // idle | ok | warn | err
 let pdSheetLastStatusText = 'Sheet sync: waiting…';
 let pdBackendState = 'checking'; // checking | connected | disconnected
 const totersPeopleByEmail = new Map();
+let viewerStatusOverrides = {pd:{}, uxr:{}};
+const VIEWER_STATUS_OVERRIDES_KEY = 'viewer-status-overrides-v1';
 
 function renderSheetSyncBadge(){
   renderBoardSyncPill();
@@ -208,6 +211,14 @@ function auditSheetTaskRequiredFieldsInState(){
     }
   });
   return changed;
+}
+function taskUsesViewerStatusIsolation(task){
+  return task && (task.statusScope==='viewer' || task.statusIsolation==='viewer');
+}
+function getEffectiveTaskStatus(board, task, globalStatus){
+  if(!taskUsesViewerStatusIsolation(task)) return globalStatus;
+  const scoped = viewerStatusOverrides[board] || {};
+  return scoped[task.id] || globalStatus;
 }
 function isTotersEmail(v){
   const email = String(v||'').trim().toLowerCase();
@@ -818,6 +829,8 @@ async function fetchSheetRowsFromBackend(){
       productDesigner: normalizePeopleCsv((t.productDesigner||t.assignee||'').trim()),
       productManager: normalizePeopleCsv((t.productManager||t.pm||'').trim()),
       engineers: normalizePeopleCsv((t.engineers||'').trim()),
+      notes: String(t.notes||'').trim(),
+      addedBy: String(t.addedBy || t.added_by || 'google_sheet').trim(),
       startDate: toIsoDate(t.startDate || ''),
       estDate: toIsoDate(t.estDate || ''),
       missingRequiredFields: Array.isArray(t.missingRequiredFields) ? t.missingRequiredFields : missingRequiredFieldsForSheetTask({
@@ -857,6 +870,8 @@ function upsertSheetTasksFromMappedRows(mappedRows){
     const productDesigner = item.productDesigner || '';
     const productManager = item.productManager || '';
     const engineers = item.engineers || '';
+    const notes = item.notes || '';
+    const addedBy = item.addedBy || 'google_sheet';
     const startDate = item.startDate || '';
     const estDate = item.estDate || '';
     const missingRequiredFields = Array.isArray(item.missingRequiredFields) ? item.missingRequiredFields : missingRequiredFieldsForSheetTask({title, appName, productDesigner, productManager, startDate, estDate});
@@ -885,6 +900,9 @@ function upsertSheetTasksFromMappedRows(mappedRows){
         productDesigner,
         productManager,
         engineers,
+        notes,
+        addedBy,
+        added_by: addedBy,
         assignee: productDesigner || 'Unassigned',
         startDate,
         estDate,
@@ -904,13 +922,16 @@ function upsertSheetTasksFromMappedRows(mappedRows){
       }
       added++;
     } else {
-      const changed = existing.title!==title || existing.appName!==appName || (existing.productDesigner||existing.assignee||'')!==productDesigner || (existing.productManager||'')!==productManager || (existing.engineers||'')!==engineers || (existing.startDate||'')!==startDate || (existing.estDate||'')!==estDate || existing.sheetKey!==key || JSON.stringify(existing.missingRequiredFields||[])!==JSON.stringify(missingRequiredFields);
+      const changed = existing.title!==title || existing.appName!==appName || (existing.productDesigner||existing.assignee||'')!==productDesigner || (existing.productManager||'')!==productManager || (existing.engineers||'')!==engineers || (existing.notes||'')!==notes || (existing.addedBy||existing.added_by||'google_sheet')!==addedBy || (existing.startDate||'')!==startDate || (existing.estDate||'')!==estDate || existing.sheetKey!==key || JSON.stringify(existing.missingRequiredFields||[])!==JSON.stringify(missingRequiredFields);
       if(changed){
         existing.title = title;
         existing.appName = appName;
         existing.productDesigner = productDesigner;
         existing.productManager = productManager;
         existing.engineers = engineers;
+        existing.notes = notes;
+        existing.addedBy = addedBy;
+        existing.added_by = addedBy;
         existing.assignee = productDesigner || 'Unassigned';
         existing.startDate = startDate;
         existing.estDate = estDate;
@@ -975,6 +996,7 @@ async function syncPdTasksFromSheet(options){
     const idxTitle = findHeaderIndex(headers, ['Request Title', 'Task Name', 'Title']);
     const idxApp = findHeaderIndex(headers, ['Application', 'App Name', 'App']);
     const idxPm = findHeaderIndex(headers, ['Product Manager', 'PM', 'PM Name', 'Product Manager Email']);
+    const idxNotes = findHeaderIndex(headers, ['Notes', 'Task Notes', 'Description']);
     const idxStart = findHeaderIndex(headers, ['Expected Start Time', 'Expected Start Date', 'Start Date']);
     const idxDeadline = findHeaderIndex(headers, ['Expected Deadline', 'Expected Due Date', 'Deadline', 'Due Date']);
     const idxPd = findHeaderIndex(headers, ['Product Designer', 'Designer', 'PD']);
@@ -993,6 +1015,7 @@ async function syncPdTasksFromSheet(options){
       const appName = appNameRaw || '--';
       const productDesignerRaw = ((idxPd>=0 ? cols[idxPd] : '') || '').trim();
       const productManagerRaw = ((idxPm>=0 ? cols[idxPm] : '') || '').trim();
+      const notesRaw = ((idxNotes>=0 ? cols[idxNotes] : '') || '').trim();
       mappedRows.push({
         sheetKey: `row-${mappedRows.length+1}::${sheetTaskKey(title, appName)}`,
         title,
@@ -1000,6 +1023,8 @@ async function syncPdTasksFromSheet(options){
         productDesigner: productDesignerRaw,
         productManager: productManagerRaw,
         engineers: '',
+        notes: notesRaw,
+        addedBy: 'google_sheet',
         missingRequiredFields: missingRequiredFieldsForSheetTask({
           title: titleRaw,
           appName: appNameRaw,
@@ -1117,6 +1142,20 @@ async function personalSet(key, val){
 async function personalDelete(key){
   await rawDelete(key, false);
 }
+async function loadViewerStatusOverrides(){
+  const saved = await personalGet(VIEWER_STATUS_OVERRIDES_KEY);
+  if(saved && typeof saved==='object'){
+    viewerStatusOverrides = {
+      pd: saved.pd && typeof saved.pd==='object' ? saved.pd : {},
+      uxr: saved.uxr && typeof saved.uxr==='object' ? saved.uxr : {}
+    };
+  }else{
+    viewerStatusOverrides = {pd:{}, uxr:{}};
+  }
+}
+async function saveViewerStatusOverrides(){
+  await personalSet(VIEWER_STATUS_OVERRIDES_KEY, viewerStatusOverrides);
+}
 
 const PORTAL_DATA_KEY = 'portal-data-v2';
 
@@ -1230,6 +1269,9 @@ function getAllPdTasks(){
     productDesigner: t.productDesigner || (t.pd&&t.pd.join(', ')) || '',
     productManager: t.productManager || '',
     engineers: t.engineers || '',
+    notes: t.notes || '',
+    addedBy: t.addedBy || t.added_by || 'user',
+    added_by: t.addedBy || t.added_by || 'user',
     assignee: t.productDesigner || (t.pd&&t.pd.join(', ')) || 'Unassigned',
     startDate: t.startDate||'', estDate: t.estDate||'',
     files: t.files||[], productArea: t.productArea||'', custom:false
@@ -1238,9 +1280,10 @@ function getAllPdTasks(){
   const all = base.concat(customs);
   return all.map(t=>{
     const st = pdBoardState.states[t.id] || {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString())};
+    const effectiveStatus = getEffectiveTaskStatus('pd', t, st.status);
     return Object.assign({}, t, {
       appName: normalizeMissingAppName(t.appName),
-      status: st.status,
+      status: effectiveStatus,
       history: st.history,
       applicableStatuses: st.applicableStatuses || null,
       allowedStatuses: normalizeAllowedStatuses('pd', st.applicableStatuses || null)
@@ -1255,6 +1298,9 @@ function getAllUxrTasks(){
     productDesigner: t.productDesigner || t.assignee || '',
     productManager: t.productManager || '',
     engineers: t.engineers || '',
+    notes: t.notes || '',
+    addedBy: t.addedBy || t.added_by || 'user',
+    added_by: t.addedBy || t.added_by || 'user',
     assignee: t.productDesigner || t.assignee || 'Unassigned',
     estDate: t.estDate || '',
     custom:false
@@ -1263,8 +1309,9 @@ function getAllUxrTasks(){
   const all = base.concat(customs);
   return all.map(t=>{
     const st = uxrBoardState.states[t.id] || {status:'Not Started', history:seedHistory('Not Started', new Date().toISOString())};
+    const effectiveStatus = getEffectiveTaskStatus('uxr', t, st.status);
     return Object.assign({}, t, {
-      status: st.status,
+      status: effectiveStatus,
       history: st.history,
       applicableStatuses: st.applicableStatuses || null,
       allowedStatuses: normalizeAllowedStatuses('uxr', st.applicableStatuses || null)
@@ -1302,9 +1349,10 @@ async function moveTask(board, id, newStatus){
   const store = board==='pd' ? pdBoardState : uxrBoardState;
   const key = board==='pd' ? 'pd-board-state' : 'uxr-board-state';
   const st = store.states[id];
-  if(!st || st.status===newStatus) return;
+  const task = (board==='pd' ? getAllPdTasks() : getAllUxrTasks()).find(x=>x.id===id);
+  const currentStatus = task ? task.status : (st ? st.status : '');
+  if(!st || currentStatus===newStatus) return;
   if(board==='pd'){
-    const task = getAllPdTasks().find(x=>x.id===id);
     const missing = task && Array.isArray(task.missingRequiredFields) ? task.missingRequiredFields : [];
     if(task && task.source==='sheet' && missing.length){
       showToast(`Complete required fields first: ${missing.join(', ')}`);
@@ -1316,6 +1364,14 @@ async function moveTask(board, id, newStatus){
     showToast('This task doesn\u2019t use the "'+newStatus+'" status');
     return;
   }
+  if(taskUsesViewerStatusIsolation(task)){
+    viewerStatusOverrides[board] = viewerStatusOverrides[board] || {};
+    viewerStatusOverrides[board][id] = newStatus;
+    await saveViewerStatusOverrides();
+    renderAll();
+    showToast('Updated your personal status view');
+    return;
+  }
   syncTaskStatus(store, id, newStatus);
   await storageSet(key, store);
   renderAll();
@@ -1325,11 +1381,15 @@ async function moveTask(board, id, newStatus){
 async function addPdTask(data){
   const id = uid('pd-custom');
   const productDesigner = data.productDesigner || data.assignee || '';
+  const addedBy = data.addedBy || getCurrentUserEmail() || 'user';
   pdBoardState.tasksCustom.push({id, title:data.title, appName:data.appName, featureName:data.featureName,
     pages:[],
     productDesigner,
     productManager:data.productManager||'',
     engineers:data.engineers||'',
+    notes:data.notes||'',
+    addedBy,
+    added_by: addedBy,
     assignee:productDesigner||'Unassigned',
     startDate:data.startDate||'',
     estDate:data.estDate||'',
@@ -1345,6 +1405,7 @@ async function addPdTask(data){
 async function addUxrTask(data){
   const id = uid('uxr-custom');
   const productDesigner = data.productDesigner || data.assignee || '';
+  const addedBy = data.addedBy || getCurrentUserEmail() || 'user';
   uxrBoardState.tasksCustom.push({
     id,
     title:data.title,
@@ -1352,6 +1413,9 @@ async function addUxrTask(data){
     productDesigner,
     productManager:data.productManager||'',
     engineers:data.engineers||'',
+    notes:data.notes||'',
+    addedBy,
+    added_by: addedBy,
     assignee:productDesigner||'Unassigned',
     estDate:data.estDate||'',
     custom:true
@@ -2978,9 +3042,17 @@ function openPdCardDetail(id){
     <div class="t-meta">
       ${t.appName?`<span class="tag acc">${escapeHtml(t.appName)}</span>`:''}
       <span class="tag">Product Designer: ${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</span>
+      <span class="tag">Added by: ${escapeHtml(t.addedBy||t.added_by||'user')}</span>
       ${t.startDate?`<span class="tag">Start ${fmtDate(t.startDate)}</span>`:''}
       ${t.estDate?`<span class="tag ${isOverdue(t.estDate,t.status)?'':''}" style="${isOverdue(t.estDate,t.status)?'background:var(--danger-soft);color:#A8332A':''}">Due ${fmtDate(t.estDate)}</span>`:''}
     </div>
+    <details class="d-section notes-section">
+      <summary><h5>Notes</h5></summary>
+      <textarea id="task_notes_pd_${escAttr(t.id)}" class="notes-input" placeholder="Add notes in plain text or Markdown...">${escapeHtml(t.notes||'')}</textarea>
+      <div class="modal-actions" style="margin-top:8px">
+        <button class="btn small" onclick="saveTaskNotesFromDrawer('pd','${escAttr(t.id)}','task_notes_pd_${escAttr(t.id)}')">Save notes</button>
+      </div>
+    </details>
     ${t.source==='sheet' && missingFields.length ? `<div class="d-section"><h5>Required fields missing in source sheet</h5><div class="d-empty">${escapeHtml(missingFields.join(', '))}</div></div>` : ''}
     <div class="d-section"><h5>Statuses this task uses</h5>
       <div class="status-checks">
@@ -3024,8 +3096,16 @@ function openUxrCardDetail(id){
     <h2>${escapeHtml(t.title)}</h2>
     <div class="t-meta">
       <span class="tag">Product Designer: ${escapeHtml(peopleDisplayPrimary(t.productDesigner||t.assignee))}</span>
+      <span class="tag">Added by: ${escapeHtml(t.addedBy||t.added_by||'user')}</span>
       ${t.estDate?`<span class="tag">Due ${fmtDate(t.estDate)}</span>`:''}
     </div>
+    <details class="d-section notes-section">
+      <summary><h5>Notes</h5></summary>
+      <textarea id="task_notes_uxr_${escAttr(t.id)}" class="notes-input" placeholder="Add notes in plain text or Markdown...">${escapeHtml(t.notes||'')}</textarea>
+      <div class="modal-actions" style="margin-top:8px">
+        <button class="btn small" onclick="saveTaskNotesFromDrawer('uxr','${escAttr(t.id)}','task_notes_uxr_${escAttr(t.id)}')">Save notes</button>
+      </div>
+    </details>
     <div class="d-section"><h5>Statuses this task uses</h5>
       <div class="status-checks">
         ${statusesThisTaskUses.map(st=>`<label class="status-check"><input type="checkbox" checked disabled> ${escapeHtml(st)}</label>`).join('')}
@@ -3099,6 +3179,27 @@ async function deleteTask(board, id){
   renderAll();
   showToast('Task deleted');
 }
+async function saveTaskNotesFromDrawer(board, id, inputId){
+  const input = document.getElementById(inputId);
+  if(!input) return;
+  const notes = input.value;
+  if(board==='pd'){
+    const base = DATA.pdTasks.find(t=>(t.id||t.name)===id);
+    const custom = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
+    if(base) base.notes = notes;
+    if(custom) custom.notes = notes;
+    await storageSet('pd-board-state', pdBoardState);
+  }else{
+    const base = (DATA.uxrSeedTasks||[]).find(t=>(t.id||t.name)===id);
+    const custom = (uxrBoardState.tasksCustom||[]).find(t=>t.id===id);
+    if(base) base.notes = notes;
+    if(custom) custom.notes = notes;
+    await storageSet('uxr-board-state', uxrBoardState);
+  }
+  await savePortalData();
+  renderAll();
+  showToast('Notes saved');
+}
 function editTask(board, id){
   const task = board==='pd' ? getAllPdTasks().find(x=>x.id===id) : getAllUxrTasks().find(x=>x.id===id);
   if(!task) return;
@@ -3141,6 +3242,7 @@ function editTask(board, id){
     <div class="field"><label>Owner <span class="req-star">*</span></label><input id="et_designer" value="${escAttr(task.productDesigner||task.assignee||'')}" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>PM <span class="req-star">*</span></label><input id="et_pm" value="${escAttr(task.productManager||'')}" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Engineers</label><input id="et_eng" value="${escAttr(task.engineers||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Notes</label><textarea id="et_notes" placeholder="Markdown or plain text">${escapeHtml(task.notes||'')}</textarea></div>
     <div class="field"><label>Expected start date</label><input id="et_start_date" type="date" value="${escAttr(task.startDate||'')}"></div>
     <div class="field"><label>Estimated date</label><input id="et_date" type="date" value="${escAttr(task.estDate||'')}"></div>
     <div class="field"><label>Status</label><select id="et_status">${statusOptions}</select></div>
@@ -3204,6 +3306,7 @@ function editTask(board, id){
     const productDesigner = pdPeople.list.join(', ');
     const productManager = pmPeople.list.join(', ');
     const engineers = engPeople.list.join(', ');
+    const notes = document.getElementById('et_notes').value;
     if(board==='pd'){
       if(!document.getElementById('et_app').value){ showToast('Application is required'); return; }
       if(!productDesigner){ showToast('Product Designer is required'); return; }
@@ -3218,6 +3321,7 @@ function editTask(board, id){
         base.productDesigner = productDesigner;
         base.productManager = productManager;
         base.engineers = engineers;
+        base.notes = notes;
         base.pd = productDesigner ? productDesigner.split(',').map(x=>x.trim()).filter(Boolean) : [];
         base.startDate = document.getElementById('et_start_date').value;
         base.estDate = document.getElementById('et_date').value;
@@ -3233,6 +3337,7 @@ function editTask(board, id){
         custom.productDesigner = productDesigner;
         custom.productManager = productManager;
         custom.engineers = engineers;
+        custom.notes = notes;
         custom.assignee = productDesigner || 'Unassigned';
         custom.startDate = document.getElementById('et_start_date').value;
         custom.estDate = document.getElementById('et_date').value;
@@ -3258,6 +3363,7 @@ function editTask(board, id){
         base.productDesigner = productDesigner;
         base.productManager = productManager;
         base.engineers = engineers;
+        base.notes = notes;
         base.assignee = productDesigner || 'Unassigned';
         base.estDate = document.getElementById('et_date').value;
       }
@@ -3267,6 +3373,7 @@ function editTask(board, id){
         custom.productDesigner = productDesigner;
         custom.productManager = productManager;
         custom.engineers = engineers;
+        custom.notes = notes;
         custom.assignee = productDesigner || 'Unassigned';
         custom.estDate = document.getElementById('et_date').value;
       }
@@ -3283,6 +3390,7 @@ function editTask(board, id){
 window.moveTask = moveTask;
 window.editTask = editTask;
 window.deleteTask = deleteTask;
+window.saveTaskNotesFromDrawer = saveTaskNotesFromDrawer;
 
 /* ============================================================
    ADD TASK MODALS
@@ -3307,6 +3415,7 @@ function openAddPdModal(presetStatus){
     <div class="field"><label>Owner <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>PM <span class="req-star">*</span></label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Notes</label><textarea id="f_notes" placeholder="Markdown or plain text"></textarea></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
       <label>Optional statuses this task uses</label>
@@ -3377,6 +3486,8 @@ function openAddPdModal(presetStatus){
       productDesigner: pdPeople.list.join(', '),
       productManager: pmPeople.list.join(', '),
       engineers: engPeople.list.join(', '),
+      notes: document.getElementById('f_notes').value,
+      addedBy: getCurrentUserEmail() || 'user',
       estDate: document.getElementById('f_date').value,
       status:'Not Started',
       applicableStatuses: allowedStatuses.length===fullStatusList.length ? null : allowedStatuses
@@ -3396,6 +3507,7 @@ function openAddUxrModal(presetStatus){
     <div class="field"><label>Owner <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>PM <span class="req-star">*</span></label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Notes</label><textarea id="f_notes" placeholder="Markdown or plain text"></textarea></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
       <label>Statuses this task uses</label>
@@ -3446,6 +3558,8 @@ function openAddUxrModal(presetStatus){
       productDesigner: pdPeople.list.join(', '),
       productManager: pmPeople.list.join(', '),
       engineers: engPeople.list.join(', '),
+      notes: document.getElementById('f_notes').value,
+      addedBy: getCurrentUserEmail() || 'user',
       estDate: document.getElementById('f_date').value,
       status:'Not Started', applicableStatuses: checked.length===UXR_STATUSES.length ? null : checked
     });
