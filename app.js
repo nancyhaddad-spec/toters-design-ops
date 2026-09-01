@@ -160,6 +160,7 @@ let pdSheetLastSyncedAt = 0;
 let pdSheetLastStatus = 'idle'; // idle | ok | warn | err
 let pdSheetLastStatusText = 'Sheet sync: waiting…';
 let pdBackendState = 'checking'; // checking | connected | disconnected
+let pdBackendLastFailAt = 0;
 const totersPeopleByEmail = new Map();
 let roleDirectory = {pd:[], pm:[], engineer:[]};
 let viewerStatusOverrides = {pd:{}, uxr:{}};
@@ -178,7 +179,7 @@ function renderBoardSyncPill(){
   const backendLabel = pdBackendState==='connected'
     ? 'Backend on'
     : pdBackendState==='disconnected'
-      ? 'Backend off'
+      ? (pdSheetLastStatus==='ok' ? 'Direct sync' : 'Backend off')
       : 'Backend…';
   let syncLabel = 'Syncing…';
   if(pdSheetLastStatus==='ok'){
@@ -189,9 +190,9 @@ function renderBoardSyncPill(){
   }else if(pdSheetLastStatus==='warn'){
     syncLabel = 'Sync warning';
   }
-  if(pdBackendState==='disconnected' || pdSheetLastStatus==='err'){
+  if(pdSheetLastStatus==='err'){
     el.classList.add('err');
-  }else if(pdBackendState==='checking' || pdSheetLastStatus==='warn' || pdSheetLastStatus==='idle'){
+  }else if(pdBackendState==='disconnected' || pdBackendState==='checking' || pdSheetLastStatus==='warn' || pdSheetLastStatus==='idle'){
     el.classList.add('warn');
   }else{
     el.classList.add('ok');
@@ -879,6 +880,10 @@ function reportSheetSyncError(msg){
   }
 }
 async function fetchSheetRowsFromBackend(){
+  if(pdBackendState==='disconnected' && (Date.now() - pdBackendLastFailAt) < 30000){
+    renderBackendIndicator();
+    return null;
+  }
   const fetchWithTimeout = async (url, ms)=>{
     const controller = new AbortController();
     const timer = setTimeout(()=>controller.abort(), ms);
@@ -889,9 +894,10 @@ async function fetchSheetRowsFromBackend(){
     }
   };
   try{
-    const res = await fetchWithTimeout(`${PD_SHEET_BACKEND_URL}/api/pd-sheet/tasks`, 3500);
+    const res = await fetchWithTimeout(`${PD_SHEET_BACKEND_URL}/api/pd-sheet/tasks`, 1200);
     if(!res.ok){
       pdBackendState = 'disconnected';
+      pdBackendLastFailAt = Date.now();
       renderBackendIndicator();
       return null;
     }
@@ -923,6 +929,7 @@ async function fetchSheetRowsFromBackend(){
     })).filter(t=>t.title && t.appName);
   }catch(e){
     pdBackendState = 'disconnected';
+    pdBackendLastFailAt = Date.now();
     renderBackendIndicator();
     return null;
   }
@@ -4228,10 +4235,10 @@ async function bootApp(user){
   await personalDelete(VIEWER_STATUS_OVERRIDES_KEY);
   await loadPortalData();
   await loadBoards();
-  await syncPdTasksFromSheet({showToastOnAdd:true});
+  renderAll(); // show last known shared state immediately
+  syncPdTasksFromSheet({showToastOnAdd:true}).catch(err=>console.warn('initial sync failed', err));
   startPdSheetSyncLoop();
   startGlobalTaskSyncLoop();
-  renderAll();
   await loadChatData();
   renderAllChatUI();
 }
