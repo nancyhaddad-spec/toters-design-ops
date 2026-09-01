@@ -151,6 +151,7 @@ let pdSheetLastStatus = 'idle'; // idle | ok | warn | err
 let pdSheetLastStatusText = 'Sheet sync: waiting…';
 let pdBackendState = 'checking'; // checking | connected | disconnected
 const totersPeopleByEmail = new Map();
+let roleDirectory = {pd:[], pm:[], engineer:[]};
 let viewerStatusOverrides = {pd:{}, uxr:{}};
 const VIEWER_STATUS_OVERRIDES_KEY = 'viewer-status-overrides-v1';
 
@@ -244,6 +245,7 @@ function getCurrentUserEmail(){
 }
 function getTeamDesignerEmails(){
   const set = new Set(STATIC_DESIGNER_EMAILS.map(normalizePersonEmail).filter(isTotersEmail));
+  rolePeople('pd').forEach(p=>{ if(isTotersEmail(p.email)) set.add(normalizePersonEmail(p.email)); });
   function addFrom(raw){
     splitPeople(raw).forEach(e=>{ if(isTotersEmail(e)) set.add(normalizePersonEmail(e)); });
   }
@@ -294,6 +296,58 @@ function upsertTotersPerson(profile){
 function mergeTotersPeopleDirectory(list){
   if(!Array.isArray(list)) return;
   list.forEach(upsertTotersPerson);
+}
+function setRoleDirectory(dir){
+  const safe = dir && typeof dir==='object' ? dir : {};
+  roleDirectory = {
+    pd: Array.isArray(safe.pd) ? safe.pd : [],
+    pm: Array.isArray(safe.pm) ? safe.pm : [],
+    engineer: Array.isArray(safe.engineer) ? safe.engineer : []
+  };
+  [...roleDirectory.pd, ...roleDirectory.pm, ...roleDirectory.engineer].forEach(p=>{
+    upsertTotersPerson({email:p.email, name:p.name, image:p.image});
+  });
+}
+function rolePeople(role){
+  const list = roleDirectory && Array.isArray(roleDirectory[role]) ? roleDirectory[role] : [];
+  return list.filter(p=>isTotersEmail(p.email));
+}
+function roleEmailSet(role){
+  return new Set(rolePeople(role).map(p=>normalizePersonEmail(p.email)));
+}
+function fallbackRoleEmailsFromTasks(role){
+  const emails = new Set();
+  getAllTasks().forEach(t=>{
+    let raw = '';
+    if(role==='pd') raw = t.productDesigner || t.assignee || '';
+    else if(role==='pm') raw = t.productManager || '';
+    else if(role==='engineer') raw = t.engineers || '';
+    splitPeople(raw).forEach(e=>{ if(isTotersEmail(e)) emails.add(normalizePersonEmail(e)); });
+  });
+  return [...emails];
+}
+function roleDirectoryForAutocomplete(role, fallbackEmails){
+  const roleList = rolePeople(role);
+  if(roleList.length) return roleList;
+  const emails = Array.from(new Set(
+    []
+      .concat(fallbackEmails || [])
+      .concat(fallbackRoleEmailsFromTasks(role))
+      .concat(collectTotersDirectory().map(p=>p.email))
+      .map(normalizePersonEmail)
+      .filter(isTotersEmail)
+  ));
+  return emails.map(email=>({email, name:emailToDisplayName(email), image:''}));
+}
+function isCurrentUserPd(){
+  const me = getCurrentUserEmail();
+  if(!me) return false;
+  const pdEmails = new Set(rolePeople('pd').map(p=>normalizePersonEmail(p.email)));
+  if(pdEmails.size) return pdEmails.has(me);
+  return getTeamDesignerEmails().has(me);
+}
+function canManageTasks(){
+  return isCurrentUserPd();
 }
 function personProfileByEmail(email){
   return totersPeopleByEmail.get(normalizePersonEmail(email)) || null;
@@ -397,7 +451,7 @@ function attachPeopleAutocomplete(inputId, options){
   const field = input.closest('.field') || input.parentElement;
   if(!field) return;
   function getDirectory(){
-    let list = collectTotersDirectory();
+    let list = Array.isArray(opts.directory) ? opts.directory : collectTotersDirectory();
     if(typeof opts.filter === 'function') list = list.filter(opts.filter);
     return list;
   }
@@ -826,6 +880,7 @@ async function fetchSheetRowsFromBackend(){
     const data = await res.json();
     const tasks = Array.isArray(data.tasks) ? data.tasks : [];
     mergeTotersPeopleDirectory(Array.isArray(data.peopleDirectory) ? data.peopleDirectory : []);
+    setRoleDirectory(data.roleDirectory || {});
     pdBackendState = 'connected';
     renderBackendIndicator();
     return tasks.map(t=>({
@@ -1435,6 +1490,10 @@ async function moveTask(board, id, newStatus){
 }
 
 async function addPdTask(data){
+  if(!canManageTasks()){
+    showToast('Only Product Designers can create tasks');
+    return;
+  }
   const id = uid('pd-custom');
   const productDesigner = data.productDesigner || data.assignee || '';
   const addedBy = data.addedBy || getCurrentUserEmail() || 'user';
@@ -1459,6 +1518,10 @@ async function addPdTask(data){
   showToast('Task added to PD board');
 }
 async function addUxrTask(data){
+  if(!canManageTasks()){
+    showToast('Only Product Designers can create tasks');
+    return;
+  }
   const id = uid('uxr-custom');
   const productDesigner = data.productDesigner || data.assignee || '';
   const addedBy = data.addedBy || getCurrentUserEmail() || 'user';
@@ -2945,6 +3008,12 @@ function renderBoardsPage(){
   document.querySelectorAll('#boardSubtabs .subtab-btn').forEach(b=>b.classList.toggle('active', b.dataset.board===activeBoard));
   document.getElementById('filterPdWrap').classList.toggle('disabled', activeBoard!=='pd');
   document.getElementById('filterUxrWrap').classList.toggle('disabled', activeBoard!=='uxr');
+  const addBtn = document.getElementById('addTaskBtn');
+  if(addBtn){
+    const canManage = canManageTasks();
+    addBtn.disabled = !canManage;
+    addBtn.title = canManage ? '' : 'Only Product Designers can create tasks';
+  }
 
   renderBoard(activeBoard);
 }
@@ -3025,6 +3094,7 @@ function renderBoard(board){
       </button>
     </div>`;
   }).join('');
+  const canManage = canManageTasks();
 
   el.querySelectorAll('.kcard').forEach(card=>{
     card.addEventListener('dragstart', e=>{
@@ -3043,7 +3113,8 @@ function renderBoard(board){
       el.querySelectorAll('.col').forEach(col=>col.classList.remove('drop-disabled'));
     });
     card.addEventListener('click', ()=>{
-      editTask(board, card.dataset.id);
+      if(board==='pd') openPdCardDetail(card.dataset.id);
+      else openUxrCardDetail(card.dataset.id);
     });
   });
   el.querySelectorAll('.col').forEach(col=>{
@@ -3060,6 +3131,10 @@ function renderBoard(board){
     });
   });
   el.querySelectorAll('.col-hover-add').forEach(btn=>{
+    if(!canManage){
+      btn.disabled = true;
+      btn.title = 'Only Product Designers can create tasks';
+    }
     btn.addEventListener('click', e=>{
       e.stopPropagation();
       openAddModal(btn.dataset.addBoard, btn.dataset.addStatus);
@@ -3177,8 +3252,7 @@ function openPdCardDetail(id){
     ${t.files && t.files.length?`<div class="d-section"><h5>Design &amp; research files</h5><div class="d-list">${t.files.map(u=>`<a class="ext-link" href="${u}" target="_blank">${escapeHtml(u)}</a>`).join('<br>')}</div></div>`:''}
     <div class="d-section"><h5>Status history &amp; time tracking</h5>${historyHtml(t.history)}</div>
     <div class="modal-actions">
-      <button class="btn ghost" onclick="editTask('pd','${escAttr(t.id)}')">Edit task</button>
-      <button class="btn ghost" onclick="deleteTask('pd','${escAttr(t.id)}')">Delete task</button>
+      ${canManageTasks() ? `<button class="btn ghost" onclick="editTask('pd','${escAttr(t.id)}')">Edit task</button><button class="btn ghost" onclick="deleteTask('pd','${escAttr(t.id)}')">Delete task</button>` : `<div class="d-empty">Only Product Designers can edit or delete tasks.</div>`}
     </div>
   `);
 }
@@ -3227,8 +3301,7 @@ function openUxrCardDetail(id){
     ${t.parentPdTask?`<div class="d-section"><h5>Requested by PD task</h5><div class="d-list"><div class="d-link-item" style="cursor:default"><span>${escapeHtml(parentLabel)}</span>${taskStatusChip(parent ? parent.id : t.parentPdTask)}</div></div></div>`:''}
     <div class="d-section"><h5>Status history &amp; time tracking</h5>${historyHtml(t.history)}</div>
     <div class="modal-actions">
-      <button class="btn ghost" onclick="editTask('uxr','${escAttr(t.id)}')">Edit task</button>
-      <button class="btn ghost" onclick="deleteTask('uxr','${escAttr(t.id)}')">Delete task</button>
+      ${canManageTasks() ? `<button class="btn ghost" onclick="editTask('uxr','${escAttr(t.id)}')">Edit task</button><button class="btn ghost" onclick="deleteTask('uxr','${escAttr(t.id)}')">Delete task</button>` : `<div class="d-empty">Only Product Designers can edit or delete tasks.</div>`}
     </div>
   `);
 }
@@ -3236,6 +3309,10 @@ function linkItemAndClose(type,name){
   return `<div class="d-link-item" onclick="closeDrawer();setTimeout(()=>openDetail('${type}','${escAttr(name)}'),160)"><span>${escapeHtml(name)}</span></div>`;
 }
 async function deleteTask(board, id){
+  if(!canManageTasks()){
+    showToast('Only Product Designers can delete tasks');
+    return;
+  }
   const task = board==='pd' ? getAllPdTasks().find(x=>x.id===id) : getAllUxrTasks().find(x=>x.id===id);
   if(!task) return;
   if(!window.confirm(`Delete "${task.title}"? This cannot be undone.`)) return;
@@ -3297,6 +3374,10 @@ async function saveTaskNotesFromDrawer(board, id, inputId){
   showToast('Notes saved');
 }
 function editTask(board, id){
+  if(!canManageTasks()){
+    showToast('Only Product Designers can edit tasks');
+    return;
+  }
   const task = board==='pd' ? getAllPdTasks().find(x=>x.id===id) : getAllUxrTasks().find(x=>x.id===id);
   if(!task) return;
   const apps = DATA.apps.map(a=>`<option value="${escAttr(a.name)}" ${task.appName===a.name?'selected':''}>${escapeHtml(a.name)}</option>`).join('');
@@ -3335,9 +3416,9 @@ function editTask(board, id){
       ? `<div class="field"><label>App *</label><select id="et_app"><option value="">—</option>${apps}</select></div><div class="field"><label>Feature</label><select id="et_feature"><option value="">—</option>${feats}</select></div>`
       : `<div class="field"><label>Linked PD task</label><select id="et_parent"><option value="">—</option>${pdOpts}</select></div>`
     }
-    <div class="field"><label>Owner <span class="req-star">*</span></label><input id="et_designer" value="${escAttr(task.productDesigner||task.assignee||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>PD <span class="req-star">*</span></label><input id="et_designer" value="${escAttr(task.productDesigner||task.assignee||'')}" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>PM <span class="req-star">*</span></label><input id="et_pm" value="${escAttr(task.productManager||'')}" placeholder="name@totersapp.com, ..."></div>
-    <div class="field"><label>Engineers</label><input id="et_eng" value="${escAttr(task.engineers||'')}" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Engineer</label><input id="et_eng" value="${escAttr(task.engineers||'')}" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Notes</label><textarea id="et_notes" placeholder="Markdown or plain text">${escapeHtml(task.notes||'')}</textarea></div>
     <div class="field"><label>Expected start date</label><input id="et_start_date" type="date" value="${escAttr(task.startDate||'')}"></div>
     <div class="field"><label>Estimated date</label><input id="et_date" type="date" value="${escAttr(task.estDate||'')}"></div>
@@ -3350,10 +3431,14 @@ function editTask(board, id){
     </div>
   `);
   const designerAllowlist = getTeamDesignerEmails();
+  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist));
+  const pdRoleEmailSet = new Set(pdRoleDirectory.map(p=>normalizePersonEmail(p.email)));
+  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', []);
+  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', []);
   enablePeopleFieldAutocomplete([
-    {id:'et_designer', options:{filter:p=>designerAllowlist.has(normalizePersonEmail(p.email))}},
-    {id:'et_pm'},
-    {id:'et_eng'}
+    {id:'et_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email))}},
+    {id:'et_pm', options:{directory:pmRoleDirectory}},
+    {id:'et_eng', options:{directory:engineerRoleDirectory}}
   ]);
   defaultOwnerToCurrentUser('et_designer');
   const linksToggle = document.getElementById('et_links_toggle');
@@ -3380,7 +3465,7 @@ function editTask(board, id){
     let valid = true;
     valid = validateRequiredInput(titleInput, 'Task name') && valid;
     if(board==='pd') valid = validateRequiredInput(appInput, 'Application') && valid;
-    valid = validateRequiredInput(ownerInput, 'Owner') && valid;
+    valid = validateRequiredInput(ownerInput, 'PD') && valid;
     valid = validateRequiredInput(pmInput, 'PM') && valid;
     if(!valid){ showToast('Please complete required fields'); return; }
     if(!title){ showToast('Task name is required'); return; }
@@ -3393,10 +3478,11 @@ function editTask(board, id){
       showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
       return;
     }
-    const disallowedOwners = pdPeople.list.filter(e=>!designerAllowlist.has(normalizePersonEmail(e)));
+    const effectivePdSet = pdRoleEmailSet.size ? pdRoleEmailSet : designerAllowlist;
+    const disallowedOwners = pdPeople.list.filter(e=>!effectivePdSet.has(normalizePersonEmail(e)));
     if(disallowedOwners.length){
-      setFieldErrorByInput(ownerInput, `Owner must be from designer list: ${disallowedOwners.join(', ')}`);
-      showToast('Owner must be a team designer email');
+      setFieldErrorByInput(ownerInput, `PD must be a Product Designer email: ${disallowedOwners.join(', ')}`);
+      showToast('PD must be a Product Designer email');
       return;
     }
     const productDesigner = pdPeople.list.join(', ');
@@ -3405,7 +3491,7 @@ function editTask(board, id){
     const notes = document.getElementById('et_notes').value;
     if(board==='pd'){
       if(!document.getElementById('et_app').value){ showToast('Application is required'); return; }
-      if(!productDesigner){ showToast('Product Designer is required'); return; }
+      if(!productDesigner){ showToast('PD is required'); return; }
       if(!productManager){ showToast('Product Manager is required'); return; }
       const base = DATA.pdTasks.find(t=>(t.id||t.name)===id);
       const custom = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
@@ -3508,9 +3594,9 @@ function openAddPdModal(presetStatus){
     <div class="field"><label>App <span class="req-star">*</span></label><select id="f_app"><option value="">—</option>${apps}</select></div>
     <div class="field"><label>Task name <span class="req-star">*</span></label><input id="f_title" placeholder="e.g. New Onboarding Flow"></div>
     <div class="field"><label>Feature</label><select id="f_feature"><option value="">—</option></select></div>
-    <div class="field"><label>Owner <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>PD <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>PM <span class="req-star">*</span></label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
-    <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Engineer</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Notes</label><textarea id="f_notes" placeholder="Markdown or plain text"></textarea></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
@@ -3524,10 +3610,14 @@ function openAddPdModal(presetStatus){
     </div>
   `);
   const designerAllowlist = getTeamDesignerEmails();
+  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist));
+  const pdRoleEmailSet = new Set(pdRoleDirectory.map(p=>normalizePersonEmail(p.email)));
+  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', []);
+  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', []);
   enablePeopleFieldAutocomplete([
-    {id:'f_designer', options:{filter:p=>designerAllowlist.has(normalizePersonEmail(p.email))}},
-    {id:'f_pm'},
-    {id:'f_eng'}
+    {id:'f_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email))}},
+    {id:'f_pm', options:{directory:pmRoleDirectory}},
+    {id:'f_eng', options:{directory:engineerRoleDirectory}}
   ]);
   defaultOwnerToCurrentUser('f_designer');
   const appSelect = document.getElementById('f_app');
@@ -3552,7 +3642,7 @@ function openAddPdModal(presetStatus){
     let valid = true;
     valid = validateRequiredInput(titleInput, 'Task name') && valid;
     valid = validateRequiredInput(appInput, 'Application') && valid;
-    valid = validateRequiredInput(ownerInput, 'Owner') && valid;
+    valid = validateRequiredInput(ownerInput, 'PD') && valid;
     valid = validateRequiredInput(pmInput, 'PM') && valid;
     if(!valid){ showToast('Please complete required fields'); return; }
     const title = titleInput.value.trim();
@@ -3569,13 +3659,14 @@ function openAddPdModal(presetStatus){
       showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
       return;
     }
-    const disallowedOwners = pdPeople.list.filter(e=>!designerAllowlist.has(normalizePersonEmail(e)));
+    const effectivePdSet = pdRoleEmailSet.size ? pdRoleEmailSet : designerAllowlist;
+    const disallowedOwners = pdPeople.list.filter(e=>!effectivePdSet.has(normalizePersonEmail(e)));
     if(disallowedOwners.length){
-      setFieldErrorByInput(ownerInput, `Owner must be from designer list: ${disallowedOwners.join(', ')}`);
-      showToast('Owner must be a team designer email');
+      setFieldErrorByInput(ownerInput, `PD must be a Product Designer email: ${disallowedOwners.join(', ')}`);
+      showToast('PD must be a Product Designer email');
       return;
     }
-    if(!pdPeople.list.length){ showToast('Product Designer is required'); return; }
+    if(!pdPeople.list.length){ showToast('PD is required'); return; }
     if(!pmPeople.list.length){ showToast('Product Manager is required'); return; }
     addPdTask({
       title, appName, featureName: document.getElementById('f_feature').value,
@@ -3597,12 +3688,12 @@ function openAddUxrModal(presetStatus){
   const statusChecks = UXR_STATUSES.map(s=>`<label class="status-check"><input type="checkbox" value="${escAttr(s.id)}" checked> ${escapeHtml(s.id)}</label>`).join('');
   openModal(`
     <h3>New UXR task</h3>
-    <div class="d-empty" style="margin-bottom:8px">Required fields: Task Name, Owner, PM.</div>
+    <div class="d-empty" style="margin-bottom:8px">Required fields: Task Name, PD, PM.</div>
     <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. UXR_Checkout Friction Study"></div>
     <div class="field"><label>Linked PD task</label><select id="f_parent"><option value="">—</option>${pdOptions}</select></div>
-    <div class="field"><label>Owner <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>PD <span class="req-star">*</span></label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>PM <span class="req-star">*</span></label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
-    <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Engineer</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Notes</label><textarea id="f_notes" placeholder="Markdown or plain text"></textarea></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
@@ -3615,10 +3706,14 @@ function openAddUxrModal(presetStatus){
     </div>
   `);
   const designerAllowlist = getTeamDesignerEmails();
+  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist));
+  const pdRoleEmailSet = new Set(pdRoleDirectory.map(p=>normalizePersonEmail(p.email)));
+  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', []);
+  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', []);
   enablePeopleFieldAutocomplete([
-    {id:'f_designer', options:{filter:p=>designerAllowlist.has(normalizePersonEmail(p.email))}},
-    {id:'f_pm'},
-    {id:'f_eng'}
+    {id:'f_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email))}},
+    {id:'f_pm', options:{directory:pmRoleDirectory}},
+    {id:'f_eng', options:{directory:engineerRoleDirectory}}
   ]);
   defaultOwnerToCurrentUser('f_designer');
   document.getElementById('f_submit').addEventListener('click', ()=>{
@@ -3629,7 +3724,7 @@ function openAddUxrModal(presetStatus){
     [titleInput, ownerInput, pmInput, engInput].forEach(clearFieldErrorByInput);
     let valid = true;
     valid = validateRequiredInput(titleInput, 'Task name') && valid;
-    valid = validateRequiredInput(ownerInput, 'Owner') && valid;
+    valid = validateRequiredInput(ownerInput, 'PD') && valid;
     valid = validateRequiredInput(pmInput, 'PM') && valid;
     if(!valid){ showToast('Please complete required fields'); return; }
     const title = titleInput.value.trim();
@@ -3643,10 +3738,11 @@ function openAddUxrModal(presetStatus){
       showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
       return;
     }
-    const disallowedOwners = pdPeople.list.filter(e=>!designerAllowlist.has(normalizePersonEmail(e)));
+    const effectivePdSet = pdRoleEmailSet.size ? pdRoleEmailSet : designerAllowlist;
+    const disallowedOwners = pdPeople.list.filter(e=>!effectivePdSet.has(normalizePersonEmail(e)));
     if(disallowedOwners.length){
-      setFieldErrorByInput(ownerInput, `Owner must be from designer list: ${disallowedOwners.join(', ')}`);
-      showToast('Owner must be a team designer email');
+      setFieldErrorByInput(ownerInput, `PD must be a Product Designer email: ${disallowedOwners.join(', ')}`);
+      showToast('PD must be a Product Designer email');
       return;
     }
     addUxrTask({
@@ -3663,6 +3759,10 @@ function openAddUxrModal(presetStatus){
   });
 }
 function openAddModal(board, presetStatus){
+  if(!canManageTasks()){
+    showToast('Only Product Designers can create tasks');
+    return;
+  }
   if(board==='pd') openAddPdModal(presetStatus);
   else openAddUxrModal(presetStatus);
 }

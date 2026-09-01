@@ -34,6 +34,7 @@ const state = {
   lastError: '',
   tasks: [],
   peopleDirectory: [],
+  roleDirectory: {pd:[], pm:[], engineer:[]},
   source: 'local:pd-sheet.csv'
 };
 
@@ -180,6 +181,58 @@ async function enrichPeopleDirectoryFromGoogle(peopleDirectory, authClient){
   }
   return peopleDirectory;
 }
+function userPrimaryTitle(user){
+  const org = Array.isArray(user?.organizations) ? user.organizations.find(o=>o?.primary) || user.organizations[0] : null;
+  return String(org?.title || '').trim();
+}
+function classifyRoleFromTitle(title){
+  const t = String(title||'').toLowerCase();
+  if(!t) return '';
+  if(t.includes('product designer')) return 'pd';
+  if(t.includes('product manager')) return 'pm';
+  if(t.includes('engineer')) return 'engineer';
+  return '';
+}
+async function fetchRoleDirectoryFromGoogle(authClient){
+  const empty = {pd:[], pm:[], engineer:[]};
+  if(!google || !authClient) return empty;
+  try{
+    const admin = google.admin({version:'directory_v1', auth: authClient});
+    const byRole = {pd:new Map(), pm:new Map(), engineer:new Map()};
+    let pageToken = '';
+    for(let i=0;i<8;i++){
+      const resp = await admin.users.list({
+        customer: 'my_customer',
+        maxResults: 500,
+        orderBy: 'email',
+        pageToken: pageToken || undefined,
+        projection: 'full',
+        viewType: 'domain_public',
+        query: 'isSuspended=false'
+      });
+      const users = Array.isArray(resp?.data?.users) ? resp.data.users : [];
+      users.forEach(user=>{
+        const email = normalizeEmail(user?.primaryEmail || '');
+        if(!email || !email.endsWith('@totersapp.com')) return;
+        const title = userPrimaryTitle(user);
+        const role = classifyRoleFromTitle(title);
+        if(!role) return;
+        const name = String(user?.name?.fullName || '').trim() || email;
+        const image = String(user?.thumbnailPhotoUrl || '').trim();
+        byRole[role].set(email, {email, name, image, title});
+      });
+      pageToken = String(resp?.data?.nextPageToken || '');
+      if(!pageToken) break;
+    }
+    return {
+      pd: [...byRole.pd.values()],
+      pm: [...byRole.pm.values()],
+      engineer: [...byRole.engineer.values()]
+    };
+  }catch(_err){
+    return empty;
+  }
+}
 function splitChipNamesFromText(text){
   return String(text||'')
     .split(/[,،\n]+/)
@@ -295,17 +348,23 @@ function mapTasksFromTable(table, dataCellRows){
   );
   return {nextSignature, nextTasks, peopleDirectory:[...peopleByEmail.values()]};
 }
-function applyTaskSnapshot(nextSignature, nextTasks, peopleDirectory, source){
+function applyTaskSnapshot(nextSignature, nextTasks, peopleDirectory, roleDirectory, source){
   const nextPeople = Array.isArray(peopleDirectory) ? peopleDirectory : [];
+  const nextRoles = roleDirectory && typeof roleDirectory==='object'
+    ? {pd: Array.isArray(roleDirectory.pd)?roleDirectory.pd:[], pm: Array.isArray(roleDirectory.pm)?roleDirectory.pm:[], engineer: Array.isArray(roleDirectory.engineer)?roleDirectory.engineer:[]}
+    : {pd:[], pm:[], engineer:[]};
   const peopleSignature = JSON.stringify(nextPeople.map(p=>[normalizeEmail(p.email), String(p.name||''), String(p.image||'')]));
   const prevPeopleSignature = JSON.stringify((state.peopleDirectory||[]).map(p=>[normalizeEmail(p.email), String(p.name||''), String(p.image||'')]));
-  const changed = nextSignature !== state.signature || peopleSignature !== prevPeopleSignature;
+  const roleSignature = JSON.stringify([nextRoles.pd, nextRoles.pm, nextRoles.engineer].map(arr=>arr.map(p=>[normalizeEmail(p.email), String(p.name||''), String(p.title||''), String(p.image||'')])));
+  const prevRoleSignature = JSON.stringify([state.roleDirectory?.pd||[], state.roleDirectory?.pm||[], state.roleDirectory?.engineer||[]].map(arr=>arr.map(p=>[normalizeEmail(p.email), String(p.name||''), String(p.title||''), String(p.image||'')])));
+  const changed = nextSignature !== state.signature || peopleSignature !== prevPeopleSignature || roleSignature !== prevRoleSignature;
   state.signature = nextSignature;
   state.lastSyncedAt = Date.now();
   if(changed) state.lastChangedAt = state.lastSyncedAt;
   state.lastError = '';
   state.tasks = nextTasks;
   state.peopleDirectory = nextPeople;
+  state.roleDirectory = nextRoles;
   state.source = source;
   return {changed, count: nextTasks.length};
 }
@@ -317,7 +376,7 @@ function syncFromCsv(){
   const rows = parseCsvRows(csv);
   const table = extractSheetTable(rows);
   const {nextSignature, nextTasks, peopleDirectory} = mapTasksFromTable(table);
-  return applyTaskSnapshot(nextSignature, nextTasks, peopleDirectory, 'local:pd-sheet.csv');
+  return applyTaskSnapshot(nextSignature, nextTasks, peopleDirectory, state.roleDirectory || {pd:[], pm:[], engineer:[]}, 'local:pd-sheet.csv');
 }
 async function syncFromGoogleSheets(){
   if(!google) throw new Error('GOOGLEAPIS_NOT_INSTALLED');
@@ -352,7 +411,8 @@ async function syncFromGoogleSheets(){
   const dataCellRows = cellRows.slice((table.headerRowIdx||0)+1);
   const {nextSignature, nextTasks, peopleDirectory} = mapTasksFromTable(table, dataCellRows);
   const enrichedPeople = await enrichPeopleDirectoryFromGoogle(peopleDirectory, client);
-  return applyTaskSnapshot(nextSignature, nextTasks, enrichedPeople, `google-sheets:${SHEET_ID}`);
+  const roleDirectory = await fetchRoleDirectoryFromGoogle(client);
+  return applyTaskSnapshot(nextSignature, nextTasks, enrichedPeople, roleDirectory, `google-sheets:${SHEET_ID}`);
 }
 async function syncFromSource(){
   if(google && GOOGLE_CREDENTIALS_PATH){
@@ -414,7 +474,7 @@ async function handler(req, res){
     return;
   }
   if(req.method === 'GET' && url.pathname === '/api/pd-sheet/tasks'){
-    json(res, 200, {tasks: state.tasks, peopleDirectory: state.peopleDirectory, lastSyncedAt: state.lastSyncedAt, lastChangedAt: state.lastChangedAt});
+    json(res, 200, {tasks: state.tasks, peopleDirectory: state.peopleDirectory, roleDirectory: state.roleDirectory, lastSyncedAt: state.lastSyncedAt, lastChangedAt: state.lastChangedAt});
     return;
   }
   if(req.method === 'POST' && (url.pathname === '/api/pd-sheet/sync' || url.pathname === '/api/pd-sheet/webhook')){
