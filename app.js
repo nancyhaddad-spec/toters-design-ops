@@ -3116,6 +3116,9 @@ function editTask(board, id){
     const productManager = pmPeople.list.join(', ');
     const engineers = engPeople.list.join(', ');
     if(board==='pd'){
+      if(!document.getElementById('et_app').value){ showToast('Application is required'); return; }
+      if(!productDesigner){ showToast('Product Designer is required'); return; }
+      if(!productManager){ showToast('Product Manager is required'); return; }
       const base = DATA.pdTasks.find(t=>(t.id||t.name)===id);
       const custom = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
       if(base){
@@ -3208,12 +3211,12 @@ function openAddPdModal(presetStatus){
   const statusChecks = PD_CREATION_STATUSES.map(s=>`<label class="status-check"><input type="checkbox" value="${escAttr(s)}" checked> ${escapeHtml(s)}</label>`).join('');
   openModal(`
     <h3>New PD task</h3>
-    <div class="d-empty" style="margin-bottom:8px">Fields marked with * are required.</div>
+    <div class="d-empty" style="margin-bottom:8px">${PD_REQUIRED_FIELD_HINT}</div>
     <div class="field"><label>App *</label><select id="f_app"><option value="">—</option>${apps}</select></div>
     <div class="field"><label>Task name *</label><input id="f_title" placeholder="e.g. New Onboarding Flow"></div>
     <div class="field"><label>Feature</label><select id="f_feature"><option value="">—</option></select></div>
-    <div class="field"><label>Product Designer</label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
-    <div class="field"><label>Product Manager</label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Product Designer *</label><input id="f_designer" placeholder="name@totersapp.com, ..."></div>
+    <div class="field"><label>Product Manager *</label><input id="f_pm" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Engineers</label><input id="f_eng" placeholder="name@totersapp.com, ..."></div>
     <div class="field"><label>Estimated date</label><input id="f_date" type="date"></div>
     <div class="field">
@@ -3256,6 +3259,8 @@ function openAddPdModal(presetStatus){
       showToast(`Use @${TOTERS_EMAIL_DOMAIN} emails only: ${invalid.join(', ')}`);
       return;
     }
+    if(!pdPeople.list.length){ showToast('Product Designer is required'); return; }
+    if(!pmPeople.list.length){ showToast('Product Manager is required'); return; }
     addPdTask({
       title, appName, featureName: document.getElementById('f_feature').value,
       productDesigner: pdPeople.list.join(', '),
