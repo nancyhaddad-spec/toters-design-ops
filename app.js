@@ -161,6 +161,7 @@ let pdSheetLastStatus = 'idle'; // idle | ok | warn | err
 let pdSheetLastStatusText = 'Sheet sync: waiting…';
 let pdBackendState = 'checking'; // checking | connected | disconnected
 let pdBackendLastFailAt = 0;
+const AI_FEATURES_HIDDEN = true;
 const totersPeopleByEmail = new Map();
 let roleDirectory = {pd:[], pm:[], engineer:[]};
 let viewerStatusOverrides = {pd:{}, uxr:{}};
@@ -293,6 +294,15 @@ function validateRequiredInput(input, label){
   setFieldErrorByInput(input, `${label} is required`);
   return false;
 }
+function markRequiredIfEmpty(input, label){
+  if(!input) return;
+  const value = String(input.value || '').trim();
+  if(!value){
+    setFieldErrorByInput(input, `${label} is required`);
+  }else{
+    clearFieldErrorByInput(input);
+  }
+}
 function upsertTotersPerson(profile){
   const email = normalizePersonEmail(profile && profile.email);
   if(!isTotersEmail(email)) return;
@@ -336,9 +346,34 @@ function fallbackRoleEmailsFromTasks(role){
   });
   return [...emails];
 }
-function roleDirectoryForAutocomplete(role, fallbackEmails){
+function fallbackRoleDirectoryFromAssignments(role, seedEmails){
+  const emails = new Set();
+  (seedEmails||[]).forEach(e=>{
+    const normalized = normalizePersonEmail(e);
+    if(isTotersEmail(normalized)) emails.add(normalized);
+  });
+  fallbackRoleEmailsFromTasks(role).forEach(e=>{
+    const normalized = normalizePersonEmail(e);
+    if(isTotersEmail(normalized)) emails.add(normalized);
+  });
+  return [...emails]
+    .map(email=>{
+      const profile = personProfileByEmail(email) || {};
+      return {
+        email,
+        name: profile.name || emailToDisplayName(email),
+        image: profile.image || ''
+      };
+    })
+    .sort((a,b)=>String(a.name||a.email).localeCompare(String(b.name||b.email)));
+}
+function roleDirectoryForAutocomplete(role, fallbackEmails, options){
+  const opts = options || {};
   const roleList = rolePeople(role);
   if(roleList.length) return roleList;
+  if(opts.strictRole){
+    return fallbackRoleDirectoryFromAssignments(role, fallbackEmails);
+  }
   const emails = Array.from(new Set(
     []
       .concat(fallbackEmails || [])
@@ -378,8 +413,17 @@ function emailToDisplayName(email){
 function displayUserLabel(raw){
   const normalized = normalizeCol(raw);
   if(normalized==='google_sheet' || normalized==='google sheet') return 'Google Sheet Sync';
-  if(normalized==='user') return 'User';
+  if(normalized==='user'){
+    return getCurrentUserEmail() || 'User';
+  }
   return emailToDisplayName(raw);
+}
+function resolveAddedBy(raw){
+  const value = String(raw||'').trim();
+  if(!value || normalizeCol(value)==='user'){
+    return getCurrentUserEmail() || value || 'user';
+  }
+  return value;
 }
 function peopleDisplayPrimary(raw){
   const first = splitPeople(raw)[0];
@@ -457,6 +501,12 @@ function tokenRangeForPeople(value, caret){
 function attachPeopleAutocomplete(inputId, options){
   const input = document.getElementById(inputId);
   if(!input) return;
+  // Prevent browser-native autofill overlay; use only app dropdown.
+  input.setAttribute('autocomplete', 'off');
+  input.setAttribute('autocorrect', 'off');
+  input.setAttribute('autocapitalize', 'none');
+  input.setAttribute('spellcheck', 'false');
+  input.name = `people-${inputId}`;
   const opts = options || {};
   const field = input.closest('.field') || input.parentElement;
   if(!field) return;
@@ -492,7 +542,15 @@ function attachPeopleAutocomplete(inputId, options){
     const directory = getDirectory();
     const range = tokenRangeForPeople(input.value, input.selectionStart);
     const items = getPeopleSuggestions(range.token, directory);
-    if(!items.length){ hideMenu(); return; }
+    if(!items.length){
+      if(opts.emptyText){
+        menu.innerHTML = `<div class="people-suggest-item" style="pointer-events:none;opacity:.7"><div><span>${escapeHtml(opts.emptyText)}</span><small>Check directory sync/permissions</small></div></div>`;
+        menu.style.display = 'block';
+      }else{
+        hideMenu();
+      }
+      return;
+    }
     activeItems = items;
     if(activeIdx >= items.length) activeIdx = 0;
     menu.innerHTML = items.map((p,i)=>`<button type="button" class="people-suggest-item ${i===activeIdx?'active':''}" data-email="${escAttr(p.email)}">${p.image ? `<img src="${escapeHtml(p.image)}" alt="${escAttr(p.name || p.email)}" onerror="this.remove()">` : ''}<div><span>${escapeHtml(p.name)}</span><small>${escapeHtml(p.email)}</small></div></button>`).join('');
@@ -1232,6 +1290,44 @@ document.addEventListener('visibilitychange', ()=>{
 // which persists per-browser without needing Claude.ai at all.
 const HAS_CLOUD_STORAGE = !!(window.storage && typeof window.storage.get === 'function');
 const LOCAL_PREFIX = 'design-ops-portal:';
+const SHARED_BACKEND_KEYS = new Set(['portal-data-v2', 'pd-board-state', 'uxr-board-state']);
+
+function shouldUseBackendStorage(key){
+  return SHARED_BACKEND_KEYS.has(String(key||'').trim());
+}
+async function fetchBackendJson(url, options){
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), 1600);
+  try{
+    const res = await fetch(url, Object.assign({signal: controller.signal}, options || {}));
+    if(!res.ok) return null;
+    return await res.json();
+  }catch(_err){
+    return null;
+  }finally{
+    clearTimeout(timer);
+  }
+}
+async function backendStorageGet(key){
+  const base = String(PD_SHEET_BACKEND_URL || '').replace(/\/+$/,'');
+  if(!base) return null;
+  const url = `${base}/api/shared-state/${encodeURIComponent(key)}`;
+  const data = await fetchBackendJson(url, {cache:'no-store'});
+  if(!data || !data.ok) return null;
+  return Object.prototype.hasOwnProperty.call(data, 'value') ? data.value : null;
+}
+async function backendStorageSet(key, val){
+  const base = String(PD_SHEET_BACKEND_URL || '').replace(/\/+$/,'');
+  if(!base) return false;
+  const url = `${base}/api/shared-state/${encodeURIComponent(key)}`;
+  const payload = JSON.stringify({value: val});
+  const data = await fetchBackendJson(url, {
+    method: 'PUT',
+    headers: {'Content-Type':'application/json'},
+    body: payload
+  });
+  return !!(data && data.ok);
+}
 
 async function rawGet(key, shared){
   if(HAS_CLOUD_STORAGE){
@@ -1261,11 +1357,25 @@ async function rawDelete(key, shared){
 }
 
 async function storageGet(key){
+  if(shouldUseBackendStorage(key)){
+    const backendValue = await backendStorageGet(key);
+    if(backendValue!=null){
+      await rawSet(key, JSON.stringify(backendValue), SHARED);
+      return backendValue;
+    }
+  }
   const raw = await rawGet(key, SHARED);
   if(!raw) return null;
   try{ return JSON.parse(raw); } catch(e){ return null; }
 }
 async function storageSet(key, val){
+  if(shouldUseBackendStorage(key)){
+    const ok = await backendStorageSet(key, val);
+    if(ok){
+      await rawSet(key, JSON.stringify(val), SHARED);
+      return;
+    }
+  }
   await rawSet(key, JSON.stringify(val), SHARED);
 }
 async function personalGet(key){
@@ -1407,8 +1517,8 @@ function getAllPdTasks(){
     productManager: t.productManager || '',
     engineers: t.engineers || '',
     notes: t.notes || '',
-    addedBy: t.addedBy || t.added_by || 'user',
-    added_by: t.addedBy || t.added_by || 'user',
+    addedBy: resolveAddedBy(t.addedBy || t.added_by || 'user'),
+    added_by: resolveAddedBy(t.addedBy || t.added_by || 'user'),
     assignee: t.productDesigner || (t.pd&&t.pd.join(', ')) || 'Unassigned',
     startDate: t.startDate||'', estDate: t.estDate||'',
     files: t.files||[], productArea: t.productArea||'', custom:false
@@ -1436,8 +1546,8 @@ function getAllUxrTasks(){
     productManager: t.productManager || '',
     engineers: t.engineers || '',
     notes: t.notes || '',
-    addedBy: t.addedBy || t.added_by || 'user',
-    added_by: t.addedBy || t.added_by || 'user',
+    addedBy: resolveAddedBy(t.addedBy || t.added_by || 'user'),
+    added_by: resolveAddedBy(t.addedBy || t.added_by || 'user'),
     assignee: t.productDesigner || t.assignee || 'Unassigned',
     estDate: t.estDate || '',
     custom:false
@@ -1514,7 +1624,7 @@ async function addPdTask(data){
   }
   const id = uid('pd-custom');
   const productDesigner = data.productDesigner || data.assignee || '';
-  const addedBy = data.addedBy || getCurrentUserEmail() || 'user';
+  const addedBy = resolveAddedBy(data.addedBy || getCurrentUserEmail() || 'user');
   pdBoardState.tasksCustom.push({id, title:data.title, appName:data.appName, featureName:data.featureName,
     pages:[],
     productDesigner,
@@ -1542,7 +1652,7 @@ async function addUxrTask(data){
   }
   const id = uid('uxr-custom');
   const productDesigner = data.productDesigner || data.assignee || '';
-  const addedBy = data.addedBy || getCurrentUserEmail() || 'user';
+  const addedBy = resolveAddedBy(data.addedBy || getCurrentUserEmail() || 'user');
   uxrBoardState.tasksCustom.push({
     id,
     title:data.title,
@@ -1578,7 +1688,27 @@ function showToast(msg){
 /* ============================================================
    NAVIGATION
    ============================================================ */
-function activatePage(page){
+function hideAiEntryPoints(){
+  document.querySelectorAll('.tab-btn[data-page="iamap"]').forEach(btn=>{ btn.style.display = 'none'; });
+  if(!AI_FEATURES_HIDDEN) return;
+  document.querySelectorAll('.tab-btn[data-page="ai"]').forEach(btn=>{ btn.style.display = 'none'; });
+  const fab = document.getElementById('chatFab');
+  if(fab) fab.style.display = 'none';
+}
+function activatePage(page, options){
+  const opts = options || {};
+  if(page === 'ai' && AI_FEATURES_HIDDEN){
+    page = 'dashboard';
+  }
+  if(page === 'iamap'){
+    page = 'database';
+    opts.dbTab = 'iamap';
+  }else if(page === 'database' && !opts.dbTab){
+    opts.dbTab = 'apps';
+  }
+  if(page === 'database' && opts.dbTab){
+    dbTab = opts.dbTab;
+  }
   const btn = document.querySelector(`.tab-btn[data-page="${page}"]`);
   const section = document.getElementById('page-'+page);
   if(!btn || !section) return false;
@@ -1587,11 +1717,18 @@ function activatePage(page){
   btn.classList.add('active');
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   section.classList.add('active');
+  if(page==='database'){
+    const subtabs = document.getElementById('dbSubtabs');
+    if(subtabs){
+      subtabs.querySelectorAll('.subtab-btn').forEach(x=>x.classList.toggle('active', x.dataset.db===dbTab));
+    }
+    renderDatabase();
+  }
 
   document.getElementById('sidebar').classList.remove('open');
-  const isAiPage = page === 'ai';
+  const isAiPage = page === 'ai' && !AI_FEATURES_HIDDEN;
   const fab = document.getElementById('chatFab');
-  if(fab) fab.style.display = isAiPage ? 'none' : 'flex';
+  if(fab) fab.style.display = (AI_FEATURES_HIDDEN || isAiPage) ? 'none' : 'flex';
   if(isAiPage){
     document.getElementById('chatPanel').classList.remove('open');
     renderAllChatUI();
@@ -1608,18 +1745,23 @@ function activatePage(page){
 document.getElementById('tabNav').addEventListener('click', (e)=>{
   const btn = e.target.closest('.tab-btn');
   if(!btn) return;
+  if(AI_FEATURES_HIDDEN && btn.dataset.page==='ai') return;
 
   if(window.PORTAL_MULTI_FILE === true){
     const targetPage = btn.dataset.page;
-    const targetFile = targetPage + '.html';
+    if(AI_FEATURES_HIDDEN && targetPage==='ai'){
+      window.location.href = 'dashboard.html';
+      return;
+    }
+    const targetFile = targetPage==='iamap' ? 'database.html#iamap' : (targetPage + '.html');
     const currentFile = window.location.pathname.split('/').pop() || '';
-    if(currentFile !== targetFile){
+    if(currentFile !== targetFile.replace('#iamap','')){
       window.location.href = targetFile;
       return;
     }
   }
 
-  activatePage(btn.dataset.page);
+  activatePage(btn.dataset.page, {dbTab: btn.dataset.page==='database' ? 'apps' : undefined});
 });
 
 if(window.PORTAL_MULTI_FILE !== true){
@@ -1629,8 +1771,10 @@ if(window.PORTAL_MULTI_FILE !== true){
   });
 }
 
+hideAiEntryPoints();
 const hashPage = (window.location.hash || '').replace('#','');
-const entryPage = hashPage || window.PORTAL_ENTRY_PAGE || 'dashboard';
+const requestedEntryPage = hashPage || window.PORTAL_ENTRY_PAGE || 'dashboard';
+const entryPage = (AI_FEATURES_HIDDEN && requestedEntryPage==='ai') ? 'dashboard' : requestedEntryPage;
 activatePage(entryPage);
 document.getElementById('mobileNavBtn').addEventListener('click', ()=>{
   document.getElementById('sidebar').classList.toggle('open');
@@ -2152,6 +2296,31 @@ document.getElementById('viewUxrLogBtn').addEventListener('click', ()=>goToMovem
    ============================================================ */
 let dbTab = 'apps';
 let dbQuery = '';
+function ensureDatabaseIaMapView(){
+  const dbSubtabs = document.getElementById('dbSubtabs');
+  if(dbSubtabs && !dbSubtabs.querySelector('.subtab-btn[data-db="iamap"]')){
+    const btn = document.createElement('button');
+    btn.className = 'subtab-btn';
+    btn.dataset.db = 'iamap';
+    btn.textContent = 'IA Map';
+    dbSubtabs.appendChild(btn);
+  }
+  const dbPage = document.getElementById('page-database');
+  const iaPage = document.getElementById('page-iamap');
+  if(!dbPage || !iaPage) return;
+  let merged = document.getElementById('dbIaMapView');
+  if(!merged){
+    merged = document.createElement('div');
+    merged.id = 'dbIaMapView';
+    dbPage.appendChild(merged);
+  }
+  if(!merged.dataset.merged){
+    const nodes = Array.from(iaPage.children);
+    nodes.forEach(n=>merged.appendChild(n));
+    merged.dataset.merged = '1';
+  }
+  iaPage.style.display = 'none';
+}
 
 document.getElementById('dbSubtabs').addEventListener('click', e=>{
   const b = e.target.closest('.subtab-btn'); if(!b) return;
@@ -2274,7 +2443,24 @@ function openDbEntityModal(type, id){
 window.openDbEntityModal = openDbEntityModal;
 
 function renderDatabase(){
+  ensureDatabaseIaMapView();
   const grid = document.getElementById('dbGrid');
+  const toolbar = document.querySelector('#page-database .db-toolbar');
+  const mapView = document.getElementById('dbIaMapView');
+  if(dbTab==='iamap'){
+    if(toolbar) toolbar.style.display = 'none';
+    if(grid) grid.style.display = 'none';
+    if(mapView) mapView.style.display = 'block';
+    document.getElementById('dbCount').textContent = '';
+    const addBtn = document.getElementById('dbAddBtn');
+    if(addBtn) addBtn.style.display = 'none';
+    renderMapFilterPanel();
+    renderMindmap();
+    return;
+  }
+  if(toolbar) toolbar.style.display = '';
+  if(grid) grid.style.display = '';
+  if(mapView) mapView.style.display = 'none';
   let items = [];
   if(dbTab==='apps') items = DATA.apps;
   if(dbTab==='features') items = DATA.features;
@@ -3449,16 +3635,33 @@ function editTask(board, id){
     </div>
   `);
   const designerAllowlist = getTeamDesignerEmails();
-  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist));
+  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist), {strictRole:true});
   const pdRoleEmailSet = new Set(pdRoleDirectory.map(p=>normalizePersonEmail(p.email)));
-  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', []);
-  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', []);
+  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', [], {strictRole:true});
+  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', [], {strictRole:true});
   enablePeopleFieldAutocomplete([
-    {id:'et_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email))}},
-    {id:'et_pm', options:{directory:pmRoleDirectory}},
-    {id:'et_eng', options:{directory:engineerRoleDirectory}}
+    {id:'et_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email)), emptyText:'No Product Designer directory users'}},
+    {id:'et_pm', options:{directory:pmRoleDirectory, emptyText:'No Product Manager directory users'}},
+    {id:'et_eng', options:{directory:engineerRoleDirectory, emptyText:'No Engineer directory users'}}
   ]);
   defaultOwnerToCurrentUser('et_designer');
+  const titleInput = document.getElementById('et_title');
+  const appInput = board==='pd' ? document.getElementById('et_app') : null;
+  const ownerInput = document.getElementById('et_designer');
+  const pmInput = document.getElementById('et_pm');
+  const requiredOnEdit = [
+    {input:titleInput, label:'Task name'},
+    {input:ownerInput, label:'PD'},
+    {input:pmInput, label:'PM'}
+  ];
+  if(board==='pd') requiredOnEdit.splice(1, 0, {input:appInput, label:'Application'});
+  requiredOnEdit.forEach(({input, label})=>{
+    markRequiredIfEmpty(input, label);
+    if(input){
+      input.addEventListener('input', ()=>markRequiredIfEmpty(input, label));
+      input.addEventListener('change', ()=>markRequiredIfEmpty(input, label));
+    }
+  });
   const linksToggle = document.getElementById('et_links_toggle');
   if(linksToggle){
     linksToggle.addEventListener('click', ()=>{
@@ -3515,6 +3718,8 @@ function editTask(board, id){
       const custom = (pdBoardState.tasksCustom||[]).find(t=>t.id===id);
       if(base){
         const oldName = base.name;
+        base.addedBy = resolveAddedBy(base.addedBy || base.added_by || 'user');
+        base.added_by = base.addedBy;
         base.name = title;
         base.apps = document.getElementById('et_app').value ? [document.getElementById('et_app').value] : [];
         base.feature = document.getElementById('et_feature').value;
@@ -3531,6 +3736,8 @@ function editTask(board, id){
         DATA.productAreas.forEach(a=>replaceInArray(a.tasks, oldName, base.name));
       }
       if(custom){
+        custom.addedBy = resolveAddedBy(custom.addedBy || custom.added_by || 'user');
+        custom.added_by = custom.addedBy;
         custom.title = title;
         custom.appName = document.getElementById('et_app').value;
         custom.featureName = document.getElementById('et_feature').value;
@@ -3558,6 +3765,8 @@ function editTask(board, id){
       const base = (DATA.uxrSeedTasks||[]).find(t=>(t.id||t.name)===id);
       const custom = (uxrBoardState.tasksCustom||[]).find(t=>t.id===id);
       if(base){
+        base.addedBy = resolveAddedBy(base.addedBy || base.added_by || 'user');
+        base.added_by = base.addedBy;
         base.name = title;
         base.parentPdTaskId = document.getElementById('et_parent').value;
         base.productDesigner = productDesigner;
@@ -3568,6 +3777,8 @@ function editTask(board, id){
         base.estDate = document.getElementById('et_date').value;
       }
       if(custom){
+        custom.addedBy = resolveAddedBy(custom.addedBy || custom.added_by || 'user');
+        custom.added_by = custom.addedBy;
         custom.title = title;
         custom.parentPdTask = document.getElementById('et_parent').value;
         custom.productDesigner = productDesigner;
@@ -3628,14 +3839,14 @@ function openAddPdModal(presetStatus){
     </div>
   `);
   const designerAllowlist = getTeamDesignerEmails();
-  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist));
+  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist), {strictRole:true});
   const pdRoleEmailSet = new Set(pdRoleDirectory.map(p=>normalizePersonEmail(p.email)));
-  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', []);
-  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', []);
+  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', [], {strictRole:true});
+  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', [], {strictRole:true});
   enablePeopleFieldAutocomplete([
-    {id:'f_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email))}},
-    {id:'f_pm', options:{directory:pmRoleDirectory}},
-    {id:'f_eng', options:{directory:engineerRoleDirectory}}
+    {id:'f_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email)), emptyText:'No Product Designer directory users'}},
+    {id:'f_pm', options:{directory:pmRoleDirectory, emptyText:'No Product Manager directory users'}},
+    {id:'f_eng', options:{directory:engineerRoleDirectory, emptyText:'No Engineer directory users'}}
   ]);
   defaultOwnerToCurrentUser('f_designer');
   const appSelect = document.getElementById('f_app');
@@ -3692,7 +3903,7 @@ function openAddPdModal(presetStatus){
       productManager: pmPeople.list.join(', '),
       engineers: engPeople.list.join(', '),
       notes: document.getElementById('f_notes').value,
-      addedBy: getCurrentUserEmail() || 'user',
+      addedBy: resolveAddedBy(getCurrentUserEmail() || 'user'),
       estDate: document.getElementById('f_date').value,
       status:'Not Started',
       applicableStatuses: allowedStatuses.length===fullStatusList.length ? null : allowedStatuses
@@ -3724,14 +3935,14 @@ function openAddUxrModal(presetStatus){
     </div>
   `);
   const designerAllowlist = getTeamDesignerEmails();
-  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist));
+  const pdRoleDirectory = roleDirectoryForAutocomplete('pd', Array.from(designerAllowlist), {strictRole:true});
   const pdRoleEmailSet = new Set(pdRoleDirectory.map(p=>normalizePersonEmail(p.email)));
-  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', []);
-  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', []);
+  const pmRoleDirectory = roleDirectoryForAutocomplete('pm', [], {strictRole:true});
+  const engineerRoleDirectory = roleDirectoryForAutocomplete('engineer', [], {strictRole:true});
   enablePeopleFieldAutocomplete([
-    {id:'f_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email))}},
-    {id:'f_pm', options:{directory:pmRoleDirectory}},
-    {id:'f_eng', options:{directory:engineerRoleDirectory}}
+    {id:'f_designer', options:{directory:pdRoleDirectory, filter:p=>pdRoleEmailSet.has(normalizePersonEmail(p.email)), emptyText:'No Product Designer directory users'}},
+    {id:'f_pm', options:{directory:pmRoleDirectory, emptyText:'No Product Manager directory users'}},
+    {id:'f_eng', options:{directory:engineerRoleDirectory, emptyText:'No Engineer directory users'}}
   ]);
   defaultOwnerToCurrentUser('f_designer');
   document.getElementById('f_submit').addEventListener('click', ()=>{
@@ -3769,7 +3980,7 @@ function openAddUxrModal(presetStatus){
       productManager: pmPeople.list.join(', '),
       engineers: engPeople.list.join(', '),
       notes: document.getElementById('f_notes').value,
-      addedBy: getCurrentUserEmail() || 'user',
+      addedBy: resolveAddedBy(getCurrentUserEmail() || 'user'),
       estDate: document.getElementById('f_date').value,
       status:'Not Started', applicableStatuses: checked.length===UXR_STATUSES.length ? null : checked
     });

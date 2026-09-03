@@ -17,6 +17,7 @@ const POLL_MS = Number(process.env.SHEET_SYNC_POLL_MS || 15000);
 const GOOGLE_CREDENTIALS_PATH = process.env.GOOGLE_APPLICATION_CREDENTIALS || '';
 const SHEET_ID = process.env.SHEET_ID || '12wMk4KqtNY9gQRiWAKpo_O6DSQupgfxYrwZRxAkhYUw';
 const SHEET_RANGE = process.env.SHEET_RANGE || 'A:Z';
+const SHARED_STATE_PATH = process.env.SHARED_STATE_PATH || path.join(PROJECT_DIR, 'shared-state.json');
 const GOOGLE_SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
 const GOOGLE_DIRECTORY_SCOPE = 'https://www.googleapis.com/auth/admin.directory.user.readonly';
 let syncInProgress = false;
@@ -37,6 +38,49 @@ const state = {
   roleDirectory: {pd:[], pm:[], engineer:[]},
   source: 'local:pd-sheet.csv'
 };
+const sharedState = {
+  updatedAt: 0,
+  keys: {}
+};
+function safeReadJson(filePath){
+  try{
+    if(!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if(!raw.trim()) return null;
+    return JSON.parse(raw);
+  }catch(_err){
+    return null;
+  }
+}
+function persistSharedState(){
+  const payload = JSON.stringify(sharedState, null, 2);
+  fs.writeFileSync(SHARED_STATE_PATH, payload, 'utf8');
+}
+function loadSharedState(){
+  const saved = safeReadJson(SHARED_STATE_PATH);
+  if(!saved || typeof saved!=='object') return;
+  if(saved.keys && typeof saved.keys==='object'){
+    sharedState.keys = saved.keys;
+  }
+  if(saved.updatedAt) sharedState.updatedAt = Number(saved.updatedAt) || 0;
+}
+function getSharedKey(key){
+  const entry = sharedState.keys && sharedState.keys[key];
+  if(!entry || typeof entry!=='object') return null;
+  return {
+    key,
+    value: entry.value,
+    updatedAt: Number(entry.updatedAt) || 0
+  };
+}
+function putSharedKey(key, value){
+  if(!key) throw new Error('SHARED_KEY_REQUIRED');
+  const now = Date.now();
+  sharedState.keys[key] = {value, updatedAt: now};
+  sharedState.updatedAt = now;
+  persistSharedState();
+  return getSharedKey(key);
+}
 
 function normalizeCol(s){
   return String(s || '').replace(/\uFEFF/g, '').trim().toLowerCase().replace(/\s+/g, ' ');
@@ -432,7 +476,7 @@ function json(res, code, data){
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   });
   res.end(body);
@@ -451,7 +495,7 @@ async function handler(req, res){
   if(req.method === 'OPTIONS'){
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+      'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type'
     });
     res.end();
@@ -475,6 +519,61 @@ async function handler(req, res){
   }
   if(req.method === 'GET' && url.pathname === '/api/pd-sheet/tasks'){
     json(res, 200, {tasks: state.tasks, peopleDirectory: state.peopleDirectory, roleDirectory: state.roleDirectory, lastSyncedAt: state.lastSyncedAt, lastChangedAt: state.lastChangedAt});
+    return;
+  }
+  if(req.method === 'GET' && url.pathname.startsWith('/api/shared-state/')){
+    const key = decodeURIComponent(url.pathname.replace('/api/shared-state/','').trim());
+    if(!key){
+      json(res, 400, {ok:false, error:'missing_key'});
+      return;
+    }
+    const entry = getSharedKey(key);
+    if(!entry){
+      json(res, 404, {ok:false, error:'not_found', key});
+      return;
+    }
+    json(res, 200, {ok:true, ...entry});
+    return;
+  }
+  if(req.method === 'PUT' && url.pathname.startsWith('/api/shared-state/')){
+    const key = decodeURIComponent(url.pathname.replace('/api/shared-state/','').trim());
+    if(!key){
+      json(res, 400, {ok:false, error:'missing_key'});
+      return;
+    }
+    const raw = await readBody(req);
+    let body = null;
+    try{
+      body = raw ? JSON.parse(raw) : {};
+    }catch(_err){
+      json(res, 400, {ok:false, error:'invalid_json'});
+      return;
+    }
+    if(!body || !Object.prototype.hasOwnProperty.call(body, 'value')){
+      json(res, 400, {ok:false, error:'missing_value'});
+      return;
+    }
+    try{
+      const saved = putSharedKey(key, body.value);
+      json(res, 200, {ok:true, ...saved});
+    }catch(err){
+      json(res, 500, {ok:false, error:String(err && err.message || err)});
+    }
+    return;
+  }
+  if(req.method === 'GET' && url.pathname === '/api/shared-state'){
+    const keysParam = String(url.searchParams.get('keys') || '').trim();
+    if(!keysParam){
+      json(res, 400, {ok:false, error:'missing_keys'});
+      return;
+    }
+    const keys = keysParam.split(',').map(k=>k.trim()).filter(Boolean);
+    const entries = {};
+    keys.forEach(k=>{
+      const entry = getSharedKey(k);
+      if(entry) entries[k] = entry;
+    });
+    json(res, 200, {ok:true, entries, updatedAt: sharedState.updatedAt});
     return;
   }
   if(req.method === 'POST' && (url.pathname === '/api/pd-sheet/sync' || url.pathname === '/api/pd-sheet/webhook')){
@@ -510,6 +609,7 @@ async function runSyncTick(){
   }
 }
 
+loadSharedState();
 runSyncTick();
 setInterval(()=>{ runSyncTick(); }, POLL_MS);
 
