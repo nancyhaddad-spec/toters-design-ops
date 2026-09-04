@@ -1291,6 +1291,7 @@ document.addEventListener('visibilitychange', ()=>{
 const HAS_CLOUD_STORAGE = !!(window.storage && typeof window.storage.get === 'function');
 const LOCAL_PREFIX = 'design-ops-portal:';
 const SHARED_BACKEND_KEYS = new Set(['portal-data-v2', 'pd-board-state', 'uxr-board-state']);
+let sharedSyncWarningAt = 0;
 
 function shouldUseBackendStorage(key){
   return SHARED_BACKEND_KEYS.has(String(key||'').trim());
@@ -1308,13 +1309,34 @@ async function fetchBackendJson(url, options){
     clearTimeout(timer);
   }
 }
+async function fetchBackendEntry(url, options){
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), 1600);
+  try{
+    const res = await fetch(url, Object.assign({signal: controller.signal}, options || {}));
+    let body = null;
+    try{ body = await res.json(); }catch(_err){ body = null; }
+    return {ok: res.ok, status: res.status, body};
+  }catch(_err){
+    return {ok:false, status:0, body:null};
+  }finally{
+    clearTimeout(timer);
+  }
+}
 async function backendStorageGet(key){
   const base = String(PD_SHEET_BACKEND_URL || '').replace(/\/+$/,'');
   if(!base) return null;
   const url = `${base}/api/shared-state/${encodeURIComponent(key)}`;
-  const data = await fetchBackendJson(url, {cache:'no-store'});
-  if(!data || !data.ok) return null;
-  return Object.prototype.hasOwnProperty.call(data, 'value') ? data.value : null;
+  const resp = await fetchBackendEntry(url, {cache:'no-store'});
+  if(resp.ok && resp.body && Object.prototype.hasOwnProperty.call(resp.body, 'value')){
+    pdBackendState = 'connected';
+    renderBackendIndicator();
+    return resp.body.value;
+  }
+  if(resp.status===404) return null;
+  pdBackendState = 'disconnected';
+  renderBackendIndicator();
+  return null;
 }
 async function backendStorageSet(key, val){
   const base = String(PD_SHEET_BACKEND_URL || '').replace(/\/+$/,'');
@@ -1326,7 +1348,17 @@ async function backendStorageSet(key, val){
     headers: {'Content-Type':'application/json'},
     body: payload
   });
-  return !!(data && data.ok);
+  const ok = !!(data && data.ok);
+  pdBackendState = ok ? 'connected' : 'disconnected';
+  renderBackendIndicator();
+  if(!ok){
+    const now = Date.now();
+    if((now - sharedSyncWarningAt) > 7000){
+      showToast('Shared backend unavailable. Changes may not sync to other users.');
+      sharedSyncWarningAt = now;
+    }
+  }
+  return ok;
 }
 
 async function rawGet(key, shared){
